@@ -54,6 +54,8 @@ public:
 
     sqlite3 *handle() const;
 
+    static QString libraryVersion();
+
 private:
     void close();
     void finalize();

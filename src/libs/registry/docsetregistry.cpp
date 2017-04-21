@@ -26,6 +26,8 @@
 #include "searchquery.h"
 #include "searchresult.h"
 
+#include <util/tracehelper.h>
+
 #include <QDir>
 #include <QThread>
 
@@ -143,6 +145,8 @@ void DocsetRegistry::search(const QString &query)
 
 void DocsetRegistry::_runQuery(const QString &query)
 {
+    TRACE(qPrintable(query));
+
     m_cancellationToken.reset();
 
     QList<Docset *> enabledDocsets;

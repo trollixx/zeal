@@ -28,6 +28,7 @@
 
 #include <util/plist.h>
 #include <util/sqlitedatabase.h>
+#include <util/tracehelper.h>
 
 #include <QDir>
 #include <QFile>
@@ -41,6 +42,8 @@
 #include <sqlite3.h>
 
 #include <cstring>
+
+#include <QDebug>
 
 using namespace Zeal::Registry;
 
@@ -129,12 +132,17 @@ Docset::Docset(const QString &path) :
         return;
     }
 
-    sqlite3_create_function(m_db->handle(), "zealScore", 2, SQLITE_UTF8, nullptr, sqliteScoreFunction,
-                            nullptr, nullptr);
+    sqlite3_create_function(m_db->handle(), "zealScore", 2, SQLITE_UTF8, nullptr,
+                            sqliteScoreFunction, nullptr, nullptr);
 
+    qDebug() << m_db->tables();
     m_type = m_db->tables().contains(QStringLiteral("searchIndex")) ? Type::Dash : Type::ZDash;
 
     createIndex();
+
+    if (m_type == Docset::Type::ZDash) {
+        createView();
+    }
 
     if (!dir.cd(QStringLiteral("Documents"))) {
         m_type = Type::Invalid;
@@ -254,37 +262,46 @@ const QMap<QString, QUrl> &Docset::symbols(const QString &symbolType) const
 
 QList<SearchResult> Docset::search(const QString &query, const CancellationToken &token) const
 {
-    // Make it safe to use in a SQL query.
-    QString sanitizedQuery = query;
-    sanitizedQuery.replace(QLatin1Char('\''), QLatin1String("''"));
+    char name[50];
+    qstrcpy(name, m_name.toLocal8Bit().constData());
+    TRACE(name);
 
     QString queryStr;
     if (m_type == Docset::Type::Dash) {
-        queryStr = QStringLiteral("SELECT name, type, path, '', zealScore('%1', name) as score "
-                                  "    FROM searchIndex "
-                                  "WHERE score > 0 "
-                                  "ORDER BY score DESC").arg(sanitizedQuery);
+        queryStr = QStringLiteral("SELECT name, type, path, '', zealScore('%1', name) as score"
+                                  "  FROM searchIndex"
+                                  "  WHERE score > 0"
+                                  "  ORDER BY score DESC");
+        /*queryStr = QStringLiteral("SELECT name, type, path, ''"
+                                  "  FROM searchIndex"
+                                  "  WHERE (name LIKE '%%1%' ESCAPE '\\')"
+                                  "  ORDER BY name COLLATE NOCASE");*/
     } else {
-        queryStr = QStringLiteral("SELECT ztokenname, ztypename, zpath, zanchor, zealScore('%1', ztokenname) as score "
-                                  "    FROM ztoken "
-                                  "LEFT JOIN ztokenmetainformation "
-                                  "    ON ztoken.zmetainformation = ztokenmetainformation.z_pk "
-                                  "LEFT JOIN zfilepath "
-                                  "    ON ztokenmetainformation.zfile = zfilepath.z_pk "
-                                  "LEFT JOIN ztokentype "
-                                  "    ON ztoken.ztokentype = ztokentype.z_pk "
-                                  "WHERE score > 0 "
-                                  "ORDER BY score DESC").arg(sanitizedQuery);
+        queryStr = QStringLiteral("SELECT name, type, path, fragment, zealScore('%1', name) as score"
+                                  "  FROM searchIndex"
+                                  "  WHERE score > 0"
+                                  "  ORDER BY score DESC");
+        /*queryStr = QStringLiteral("SELECT name, type, path, fragment"
+                                  "  FROM searchIndex"
+                                  "  WHERE (name LIKE '%%1%' ESCAPE '\\')"
+                                  "  ORDER BY name COLLATE NOCASE");*/
     }
 
     // Limit for very short queries.
     // TODO: Show a notification about the reduced result set.
     if (query.size() < 3)
-        queryStr += QLatin1String(" LIMIT 1000");
+        queryStr += QLatin1String("  LIMIT 1000");
+
+    // Make it safe to use in a SQL query.
+    QString sanitizedQuery = query;
+    sanitizedQuery.replace(QLatin1Char('\''), QLatin1String("''"));
 
     QList<SearchResult> results;
 
-    m_db->prepare(queryStr);
+    m_db->prepare(queryStr.arg(sanitizedQuery));
+
+    //TRACE(name);
+
     while (m_db->next() && !token.isCanceled()) {
         results.append({m_db->value(0).toString(),
                         parseSymbolType(m_db->value(1).toString()),
@@ -410,7 +427,7 @@ void Docset::loadSymbols(const QString &symbolType, const QString &symbolString)
 {
     QString queryStr;
     if (m_type == Docset::Type::Dash) {
-        queryStr = QStringLiteral("SELECT name, path FROM searchIndex WHERE type='%1' ORDER BY name ASC");
+        queryStr = QStringLiteral("SELECT name, path FROM searchIndex WHERE type='%1' ORDER BY name");
     } else {
         queryStr = QStringLiteral("SELECT ztokenname, zpath, zanchor "
                                   "FROM ztoken "
@@ -465,6 +482,26 @@ void Docset::createIndex()
     m_db->execute(indexCreateQuery.arg(IndexNamePrefix, IndexNameVersion, tableName, columnName));
 }
 
+void Docset::createView()
+{
+    static const QString viewCreateQuery
+            = QStringLiteral("CREATE VIEW IF NOT EXISTS searchIndex AS"
+                             "  SELECT"
+                             "    ztokenname AS name,"
+                             "    ztypename AS type,"
+                             "    zpath AS path,"
+                             "    zanchor AS fragment"
+                             "  FROM ztoken"
+                             "  INNER JOIN ztokenmetainformation"
+                             "    ON ztoken.zmetainformation = ztokenmetainformation.z_pk"
+                             "  INNER JOIN zfilepath"
+                             "    ON ztokenmetainformation.zfile = zfilepath.z_pk"
+                             "  INNER JOIN ztokentype"
+                             "    ON ztoken.ztokentype = ztokentype.z_pk");
+
+    m_db->execute(viewCreateQuery);
+}
+
 QUrl Docset::createPageUrl(const QString &path, const QString &fragment) const
 {
     QString realPath;
@@ -479,6 +516,9 @@ QUrl Docset::createPageUrl(const QString &path, const QString &fragment) const
         realPath = path;
         realFragment = fragment;
     }
+
+    if (realPath.contains("dash_entry_"))
+        qDebug() << realPath << (m_type == Type::ZDash);
 
     static const QRegularExpression dashEntryRegExp(QLatin1String("<dash_entry_.*>"));
     realPath.remove(dashEntryRegExp);

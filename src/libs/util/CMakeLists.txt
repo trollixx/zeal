@@ -5,6 +5,8 @@ add_library(Util
     plist.cpp
     sqlitedatabase.cpp
     version.cpp
+
+    tracehelper.cpp
 )
 
 find_package(Qt5Core REQUIRED)

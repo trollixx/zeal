@@ -84,6 +84,7 @@ private:
     void loadSymbols(const QString &symbolType) const;
     void loadSymbols(const QString &symbolType, const QString &symbolString) const;
     void createIndex();
+    void createView();
     QUrl createPageUrl(const QString &path, const QString &fragment = QString()) const;
 
     static QString parseSymbolType(const QString &str);

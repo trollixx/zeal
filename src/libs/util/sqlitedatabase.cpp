@@ -236,3 +236,8 @@ sqlite3 *SQLiteDatabase::handle() const
 {
     return m_db;
 }
+
+QString SQLiteDatabase::libraryVersion()
+{
+    return QString::fromLocal8Bit(sqlite3_libversion());
+}
