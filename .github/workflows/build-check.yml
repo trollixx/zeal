@@ -119,9 +119,10 @@ jobs:
           cmakeListsOrSettingsJson: CMakeListsTxtAdvanced
           useVcpkgToolchainFile: true
 
+  # act -P ubuntu-18.04=nektos/act-environments-ubuntu:18.04 -j appimage -r -v
   appimage:
     name: AppImage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-18.04
 
     steps:
       - name: Checkout
