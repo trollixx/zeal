@@ -170,13 +170,17 @@ jobs:
         with:
           vcpkgDirectory: ${{ github.workspace }}/.vcpkg
 
+      - uses: actions/setup-go@v6
+
       - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          arch: ${{ matrix.config.arch }}
-          modules: ${{ matrix.config.qt_modules }}
-          version: ${{ matrix.config.qt_version }}
-          cache: true
+        run: |
+          go install github.com/trollixx/qvm/cmd/qvm@latest
+          qvm config set install.dir {{ runner.workspace }}/qt
+          # qvm install qt@${{ matrix.config.qt_version }} --modules ${{ matrix.config.qt_modules }}
+          qvm install qt@${{ matrix.config.qt_version }} --modules qtpositioning,qtwebchannel,qtwebengine
+          "QT_DIR=$(qvm path qt@${{ matrix.config.qt_version }})" >> $env:GITHUB_ENV
+          "Qt6_DIR=$(qvm path qt@${{ matrix.config.qt_version }})" >> $env:GITHUB_ENV
+          "Qt5_DIR=$(qvm path qt@${{ matrix.config.qt_version }})" >> $env:GITHUB_ENV
 
       - name: Configure & Build
         uses: lukka/run-cmake@v10
