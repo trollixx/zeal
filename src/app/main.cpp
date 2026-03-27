@@ -12,7 +12,9 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QIcon>
+#include <QLoggingCategory>
 #include <QMessageBox>
+#include <QStyle>
 #include <QTextStream>
 #include <QTimer>
 #include <QUrlQuery>
@@ -26,6 +28,8 @@
 #endif
 
 #include <cstdlib>
+
+static Q_LOGGING_CATEGORY(log, "zeal.app")
 
 using namespace Zeal;
 
@@ -179,17 +183,26 @@ int main(int argc, char *argv[])
     QCoreApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
 #endif
 
-// Use Fusion style on Windows 10 & 11. This enables proper dark mode support.
+// Use Fusion style on Windows 10 & 11, and AppImage-based Linux builds.
+// This enables proper dark mode support.
 // See https://www.qt.io/blog/dark-mode-on-windows-11-with-qt-6.5.
 // TODO: Make style configurable, detect -style argument.
-#if defined(Q_OS_WINDOWS) && (QT_VERSION >= QT_VERSION_CHECK(6, 5, 0))
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+#if defined(Q_OS_WINDOWS)
     const auto osName = QSysInfo::prettyProductName();
     if (osName.startsWith("Windows 10") || osName.startsWith("Windows 11")) {
         QApplication::setStyle("fusion");
     }
+#elif defined(Q_OS_LINUX)
+    if (qEnvironmentVariableIsSet("APPIMAGE")) {
+        QApplication::setStyle("fusion");
+    }
+#endif
 #endif
 
     QScopedPointer<QApplication> qapp(new QApplication(argc, argv));
+
+    qCDebug(log, "Application style: %s", qUtf8Printable(qapp->style()->objectName()));
 
     const CommandLineParameters clParams = parseCommandLine(qapp->arguments());
 
