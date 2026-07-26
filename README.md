@@ -12,8 +12,10 @@ Zeal is an offline documentation browser: your personal reference library, searc
 without a connection. Originally inspired by [Dash](https://kapeli.com/dash), it supports the same docset format.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/readme-dark.png">
-  <img alt="Zeal showing instant search results across multiple docsets" src="assets/screenshots/readme-light.png">
+  <source media="(prefers-color-scheme: dark)"
+    srcset="https://raw.githubusercontent.com/zealdocs/media/main/screenshots/windows/readme-dark.png">
+  <img alt="Zeal showing instant search results across multiple docsets"
+    src="https://raw.githubusercontent.com/zealdocs/media/main/screenshots/windows/readme-light.png">
 </picture>
 
 ## Download
