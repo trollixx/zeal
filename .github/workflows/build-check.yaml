@@ -163,6 +163,11 @@ jobs:
         if: matrix.config.publishArtifacts
         run: cmake --build --preset ${{ matrix.config.buildPreset }} --target package
 
+      - name: Test MSI
+        if: matrix.config.publishArtifacts && matrix.config.configurePreset == 'release'
+        shell: pwsh
+        run: pwsh -NoProfile -File pkg/wix/tools/test-msi.ps1 -Install
+
       - name: Upload ZIP Artifacts
         if: matrix.config.publishArtifacts
         uses: actions/upload-artifact@v7
