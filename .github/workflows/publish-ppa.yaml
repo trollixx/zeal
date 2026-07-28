@@ -166,7 +166,9 @@ jobs:
             # Guard so one rejected series doesn't abort the rest (the if-context
             # suspends set -e). Flip `first` only on success, so the orig tarball
             # still ships with the next series if this upload failed.
-            if ( cd "$work" && debuild --no-lintian -S "$tarball_opt" -k"$GPG_KEYID" -p"$HOME/.gpg-sign" ) \
+            # -d skips the build-dependency check: nothing is compiled here, and
+            # the dependencies are resolved on the Launchpad builders instead.
+            if ( cd "$work" && debuild --no-lintian -d -S "$tarball_opt" -k"$GPG_KEYID" -p"$HOME/.gpg-sign" ) \
                 && dput "$PPA" "$src_root/zeal_${file_ver}_source.changes"; then
               first=false
             else
