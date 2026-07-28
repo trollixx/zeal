@@ -279,6 +279,7 @@ jobs:
     # Only for the github.token fallback on forks.
     permissions:
       contents: write
+      discussions: write
 
     steps:
       - name: Generate App Token
@@ -289,6 +290,7 @@ jobs:
           client-id: ${{ secrets.CI_APP_ID }}
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
           permission-contents: write
+          permission-discussions: write
 
       - name: Publish Release
         run: gh release edit ${{ github.ref_name }} --draft=false --discussion-category Announcements --repo ${{ github.repository }}
