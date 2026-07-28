@@ -97,18 +97,20 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Install Trusted Signing client
+      - name: Install Artifact Signing client
         shell: pwsh
         run: |
-          $dir = Join-Path $env:RUNNER_TEMP 'trusted-signing-client'
+          $dir = Join-Path $env:RUNNER_TEMP 'artifact-signing-client'
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          nuget install Microsoft.Trusted.Signing.Client -OutputDirectory $dir -ExcludeVersion
-          $arch = if ("${{ runner.arch }}" -eq "ARM64") { "arm64" } else { "x64" }
+          # Version matches the one pinned by Azure/artifact-signing-action.
+          nuget install Microsoft.ArtifactSigning.Client -Version 1.0.128 -OutputDirectory $dir -ExcludeVersion
+          # x64 only: the package ships no arm64 dlib, so ARM64 runners use the
+          # emulated x64 signtool, which must load a matching x64 dlib.
           $dlib = Get-ChildItem -Path $dir -Filter 'Azure.CodeSigning.Dlib.dll' -Recurse |
-              Where-Object { $_.FullName -match "[\\/]$arch[\\/]" } |
+              Where-Object { $_.FullName -match "[\\/]x64[\\/]" } |
               Select-Object -First 1 -ExpandProperty FullName
           if (-not $dlib) {
-              throw "$arch Azure.CodeSigning.Dlib.dll not found in installed package."
+              throw "x64 Azure.CodeSigning.Dlib.dll not found in installed package."
           }
           "CODESIGN_AZURE_DLIB=$dlib" >> $env:GITHUB_ENV
 
