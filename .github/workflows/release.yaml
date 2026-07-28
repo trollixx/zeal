@@ -274,6 +274,9 @@ jobs:
     name: Publish Release
     needs: [build-windows, build-appimage, build-ubuntu]
     runs-on: ubuntu-latest
+    # Only for the github.token fallback on forks.
+    permissions:
+      contents: write
 
     steps:
       - name: Generate App Token
