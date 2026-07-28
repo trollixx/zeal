@@ -49,6 +49,14 @@
     <id>zeal.desktop</id>
   </provides>
   <releases>@ZEAL_APPSTREAM_DEV_RELEASE@
+    <release date="2026-07-28" version="0.9.1" type="stable">
+      <description>
+        <ul>
+          <li>Maintenance release with no changes for Linux users</li>
+        </ul>
+      </description>
+      <url>https://github.com/zealdocs/zeal/releases/tag/v0.9.1</url>
+    </release>
     <release date="2026-07-28" version="0.9.0" type="stable">
       <description>
         <ul>

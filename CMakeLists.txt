@@ -23,7 +23,7 @@ project(Zeal
     LANGUAGES CXX
 )
 
-set(ZEAL_RELEASE_VERSION "0.9.0") # x-version
+set(ZEAL_RELEASE_VERSION "0.9.1") # x-version
 
 include(ZealHelpers)
 
