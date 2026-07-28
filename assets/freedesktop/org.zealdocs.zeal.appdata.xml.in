@@ -49,6 +49,30 @@
     <id>zeal.desktop</id>
   </provides>
   <releases>@ZEAL_APPSTREAM_DEV_RELEASE@
+    <release date="2026-07-28" version="0.9.0" type="stable">
+      <description>
+        <ul>
+          <li>Added support for compressed docsets, read directly from the archive and taking far less disk space</li>
+          <li>Added page zoom controls to the View menu and a setting for the default zoom level</li>
+          <li>Added a Go menu with Back, Forward, tab switching, and focus actions, plus a Duplicate Tab command</li>
+          <li>Added download sizes to docset tooltips, showing how much space a docset needs before fetching</li>
+          <li>Added an option to hide tab close buttons and a View menu entry to toggle the sidebar</li>
+          <li>Added a --port option to keep the built-in documentation server on a fixed port</li>
+          <li>Changed the look with a new application icon, consistent icons, and redesigned built-in pages</li>
+          <li>Changed fuzzy search to be enabled by default, so searches match even when letters are skipped</li>
+          <li>Changed docset loading to run in parallel, making startup quicker when many docsets are installed</li>
+          <li>Fixed docset removal freezing the window, and cleaned up files left by failed installs or removals</li>
+          <li>Fixed docset installs reporting success on corrupt or incomplete downloads</li>
+          <li>Fixed archives being able to write files outside the docset folder</li>
+          <li>Fixed pages appearing too zoomed in on high-resolution displays</li>
+          <li>Fixed documentation pages keeping the old light or dark style when the system theme changes</li>
+          <li>Fixed searching with only a docset filter (python:), which now lists that docset's entries</li>
+          <li>Fixed duplicate downloads when installing the same docset was requested twice</li>
+          <li>Fixed search result highlighting that could be unreadable with some system themes</li>
+        </ul>
+      </description>
+      <url>https://github.com/zealdocs/zeal/releases/tag/v0.9.0</url>
+    </release>
     <release date="2026-04-04" version="0.8.1" type="stable">
       <description>
         <ul>
