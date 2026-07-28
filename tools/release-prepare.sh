@@ -75,20 +75,38 @@ would notice and care about. There is no target count: include a change \
 only if it earns its place, and leave out cosmetic trivia, internal \
 refactors, build/CI/dependency commits, and Windows-only or macOS-only \
 changes. If you cannot tell a change's user-visible effect from its diff, \
-omit it. Write each as one <li>...</li> bullet that starts with Added, \
+omit it. Write each as one plain-text line that starts with Added, \
 Changed, Removed, Deprecated, or Fixed, grouped in that order (Added first, \
-Fixed last) and most significant first within each group. Keep each bullet \
+Fixed last) and most significant first within each group. Keep each line \
 concrete and specific about what changed, in plain language a non-developer \
 understands; a short clause on why it helps is welcome. No trailing period. \
 Avoid AI cliches (em-dashes, 'delve into', 'leverage', 'robust', 'ensure', \
-'seamless', 'comprehensive'). Output the <li> lines only: no preamble, \
-commentary, or wrapping <ul>." \
+'seamless', 'comprehensive'). Output the lines only: no markup, numbering, \
+bullet characters, preamble, or commentary. If nothing qualifies, output \
+exactly one line reading: Maintenance release with no changes for Linux \
+users" \
     --allowedTools "Bash(git log:*) Bash(git show:*) Bash(git diff:*)" \
     < /dev/null \
     > build/appdata-bullets.txt
 
 today=$(date -u +%Y-%m-%d)
-indented=$(sed 's/^[[:space:]]*//; s/^/          /' build/appdata-bullets.txt)
+
+# Bullets arrive as plain text, one per line. Wrapping them here, rather than
+# asking for markup, keeps stray commentary from producing invalid XML.
+indented=$(while read -r line; do
+    [ -n "$line" ] || continue
+    # Ampersands are escaped as \& because bash 5.2+ reads a bare & in the
+    # replacement as the matched text.
+    line=${line//&/\&amp;}
+    line=${line//</\&lt;}
+    line=${line//>/\&gt;}
+    printf '          <li>%s</li>\n' "$line"
+done < build/appdata-bullets.txt)
+
+if [ -z "$indented" ]; then
+    echo "build/appdata-bullets.txt produced no bullets; aborting." >&2
+    exit 1
+fi
 cat > build/release-block.xml <<EOF
     <release date="${today}" version="${VERSION}" type="stable">
       <description>
