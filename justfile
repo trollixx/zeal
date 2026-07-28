@@ -89,19 +89,23 @@ release-prepare version:
 
 # Commit appdata + version bump, push, create the draft release with the
 # generated notes, then tag and push the tag (which triggers build CI).
-# The actual GitHub Publish click still happens manually in the UI.
+# CI publishes the release once every build job succeeds.
 # `remote` controls which remote (and matching GitHub repo) receives the push;
 # default is `origin` (works for fork testing). For an upstream release, run
 # `just release-push 0.8.2 upstream` (or whatever you've named the upstream remote).
+# The commit and tag steps are skipped if already done, so the same version can
+# be pushed to a fork first and then promoted to upstream.
 # Maintainer use only.
 [group('release')]
 release-push version remote="origin":
     git add assets/freedesktop/org.zealdocs.zeal.appdata.xml.in CMakeLists.txt
-    git commit -m "chore: release v{{version}}"
+    git diff --staged --quiet || git commit -m "chore: release v{{version}}"
+    # Annotated: `git describe` without `--tags` ignores lightweight tags, and
+    # the AUR zeal-git package derives its version that way.
+    git rev-parse -q --verify refs/tags/v{{version}} > /dev/null || git tag -a v{{version}} -m "v{{version}}"
     git push {{remote}} HEAD
     gh release create v{{version}} --draft --notes-file build/release-notes.md \
         --repo "$(git remote get-url {{remote}} | sed -E 's|^.*github\.com[:/]||; s|\.git$||')"
-    git tag v{{version}}
     git push {{remote}} v{{version}}
     @echo "Pushed v{{version}} with draft release. CI will upload artifacts."
-    @echo "When CI is done, open the draft on GitHub and click Publish."
+    @echo "Approve the 'release' environment to let the Windows jobs run."
