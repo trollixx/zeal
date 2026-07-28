@@ -10,6 +10,9 @@ repo = "zeal"
 [changelog]
 # Template docs: https://keats.github.io/tera/docs/.
 body = """\
+{%- if version and previous.version -%}
+[Full Changelog]({{ self::diff_url() }}){% if extra and extra.milestone %} | [Resolved Issues]({{ self::remote_url() }}/milestone/{{ extra.milestone }}?closed=1){% endif %}
+{% endif -%}
 {% for group, commits in commits | group_by(attribute="group") %}
   ### {{ group | striptags | trim }}
   {% for commit in commits %}
@@ -28,11 +31,6 @@ body = """\
     {%- endif %}
 {%- endfor -%}
 {%- endif -%}
-{%- if version and previous.version %}
----
-
-[Full Changelog]({{ self::diff_url() }}){% if extra and extra.milestone %} | [Resolved Issues]({{ self::remote_url() }}/milestone/{{ extra.milestone }}?closed=1){% endif %}
-{% endif %}\
 
 {%- macro remote_url() -%}
   https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}
