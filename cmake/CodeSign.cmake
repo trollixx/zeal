@@ -78,7 +78,9 @@ function(codesign)
         elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "X86")
             set(_w10sdk_arch "x86")
         elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "ARM64")
-            set(_w10sdk_arch "arm64")
+            # Emulated x64: Azure.CodeSigning.Dlib.dll ships x64/x86 only, and
+            # signtool loads it in-process, so the two must match.
+            set(_w10sdk_arch "x64")
         else()
             message(WARNING "Unknown architecture: ${CMAKE_SYSTEM_PROCESSOR}.")
         endif()
