@@ -17,7 +17,7 @@ set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 # When both match, the build is treated as a release; otherwise it's a dev build.
 # The `# x-version` marker on each version line acts as a sed anchor for the bump.
 project(Zeal
-    VERSION 0.9.1 # x-version
+    VERSION 0.9.2 # x-version
     DESCRIPTION "A simple documentation browser."
     HOMEPAGE_URL "https://zealdocs.org"
     LANGUAGES CXX
