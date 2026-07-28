@@ -16,7 +16,7 @@ on:
           - beta
           - edge
   schedule:
-    - cron: '0 0 * * 2'
+    - cron: '2 4 * * *'
 
 permissions: {}
 
