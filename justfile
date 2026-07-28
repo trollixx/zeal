@@ -109,3 +109,11 @@ release-push version remote="origin":
     git push {{remote}} v{{version}}
     @echo "Pushed v{{version}} with draft release. CI will upload artifacts."
     @echo "Approve the 'release' environment to let the Windows jobs run."
+
+# Delete the draft release, the remote tag, and the local tag for a version,
+# undoing `just release-push` so it can be run again. Refuses to delete a
+# release that is already published. Missing pieces are skipped.
+# Maintainer use only.
+[group('release')]
+release-delete version remote="origin":
+    bash tools/release-delete.sh {{version}} {{remote}}
