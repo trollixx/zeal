@@ -587,6 +587,8 @@ void DocsetsDialog::extractionError(const QString &filePath, const QString &erro
 
     delete m_tmpFiles.take(docsetName);
     delete m_tarixIndexFiles.take(docsetName);
+
+    updateStatus();
 }
 
 void DocsetsDialog::extractionProgress(const QString &filePath, qint64 extracted, qint64 total)
