@@ -98,17 +98,7 @@ release-prepare version:
 # Maintainer use only.
 [group('release')]
 release-push version remote="origin":
-    git add assets/freedesktop/org.zealdocs.zeal.appdata.xml.in CMakeLists.txt
-    git diff --staged --quiet || git commit -m "chore: release v{{version}}"
-    # Annotated: `git describe` without `--tags` ignores lightweight tags, and
-    # the AUR zeal-git package derives its version that way.
-    git rev-parse -q --verify refs/tags/v{{version}} > /dev/null || git tag -a v{{version}} -m "v{{version}}"
-    git push {{remote}} HEAD
-    gh release create v{{version}} --draft --notes-file build/release-notes.md \
-        --repo "$(git remote get-url {{remote}} | sed -E 's|^.*github\.com[:/]||; s|\.git$||')"
-    git push {{remote}} v{{version}}
-    @echo "Pushed v{{version}} with draft release. CI will upload artifacts."
-    @echo "Approve the 'release' environment to let the Windows jobs run."
+    bash tools/release-push.sh {{version}} {{remote}}
 
 # Delete the draft release, the remote tag, and the local tag for a version,
 # undoing `just release-push` so it can be run again. Refuses to delete a
