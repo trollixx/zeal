@@ -1,6 +1,4 @@
-# Experiment: vcpkg's x-gha binary source, rebuilt on top of @actions/cache.
-# Builds vcpkg from microsoft/vcpkg-tool plus .github/vcpkg-tool-x-gha.patch, then installs Zeal's vcpkg
-# dependencies twice per architecture: the first pass builds and uploads, the second should restore everything.
+# Experiment: vcpkg's x-gha binary source rebuilt on top of @actions/cache.
 
 name: Test vcpkg x-gha
 
