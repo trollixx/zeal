@@ -136,4 +136,4 @@ jobs:
       - name: Install (second pass)
         run: >-
           .vcpkg/vcpkg.exe install --triplet ${{ matrix.triplet }} --x-install-root=installed-2
-          --x-abi-tools-use-exact-versions
+          --x-abi-tools-use-exact-versions --only-binarycaching

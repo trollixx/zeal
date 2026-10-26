@@ -10,10 +10,10 @@ index 72e35229..0846e07b 100644
  /vcpkg-root
  /work
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 68659522..3aa73121 100644
+index 68659522..98f5bf32 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -293,7 +293,14 @@ elseif(VCPKG_OFFICIAL_BUILD)
+@@ -293,7 +293,16 @@ elseif(VCPKG_OFFICIAL_BUILD)
      message(FATAL_ERROR "VCPKG_ARTIFACTS_SHA is required for official builds.")
  endif()
  
@@ -21,6 +21,8 @@ index 68659522..3aa73121 100644
 +    target_compile_definitions(vcpkglib PUBLIC
 +        "VCPKG_GITHUB_ACTIONS_CACHE_ADAPTER_SHA=${VCPKG_GITHUB_ACTIONS_CACHE_ADAPTER_SHA}"
 +    )
++elseif(VCPKG_OFFICIAL_BUILD)
++    message(FATAL_ERROR "VCPKG_GITHUB_ACTIONS_CACHE_ADAPTER_SHA is required for official builds.")
 +endif()
 +
  file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg-artifacts" VCPKG_ARTIFACTS_SOURCE_DIR)
@@ -28,7 +30,7 @@ index 68659522..3aa73121 100644
  if (VCPKG_ARTIFACTS_DEVELOPMENT)
      # The directory constructed by this portion of the build script needs to be kept in sync with
      # that created by azure-pipelines/signing.yml
-@@ -395,6 +402,46 @@ if (VCPKG_ARTIFACTS_DEVELOPMENT)
+@@ -395,6 +404,46 @@ if (VCPKG_ARTIFACTS_DEVELOPMENT)
          )
  
      add_custom_target(vcpkg-artifacts-target ALL DEPENDS "${VCPKG_ARTIFACTS_BINARY}")
@@ -84,10 +86,10 @@ index 00000000..86d9c31a
 +registry=https://pkgs.dev.azure.com/vcpkg/public/_packaging/vcpkg-ecmascript-dependencies/npm/registry/
 diff --git a/github-actions-cache-adapter/main.mjs b/github-actions-cache-adapter/main.mjs
 new file mode 100644
-index 00000000..2fc7d265
+index 00000000..9040c9fc
 --- /dev/null
 +++ b/github-actions-cache-adapter/main.mjs
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,119 @@
 +// Copyright (c) Microsoft Corporation.
 +// Licensed under the MIT License.
 +
@@ -96,9 +98,12 @@ index 00000000..2fc7d265
 +// restore fails only if a lookup or download failed, not on a miss; vcpkg picks up whatever arrived.
 +
 +import * as cache from '@actions/cache';
++import { rmSync } from 'node:fs';
 +import { text } from 'node:stream/consumers';
 +
 +const RESTORE_CONCURRENCY = 8;
++const LOOKUP_ATTEMPTS = 12;
++const LOOKUP_INTERVAL_MS = 5000;
 +
 +async function forEachLimited(items, limit, work) {
 +  let next = 0;
@@ -123,41 +128,71 @@ index 00000000..2fc7d265
 +  process.env.ACTIONS_CACHE_SERVICE_V2 = 'true';
 +}
 +
-+// @actions/cache stores and extracts paths relative to GITHUB_WORKSPACE.
++// @actions/cache stores and extracts paths relative to GITHUB_WORKSPACE. It resolves them through symbolic links
++// and passes the directory to tar unquoted.
 +process.chdir(directory);
-+process.env.GITHUB_WORKSPACE = directory;
++process.env.GITHUB_WORKSPACE = process.cwd();
++if (/\s/.test(process.cwd())) {
++  console.error(`error: @actions/cache cannot work in a directory whose path contains spaces: ${process.cwd()}`);
++  process.exit(2);
++}
++
++// @actions/cache reports some outcomes only in its log.
++let log = '';
++const writeStdout = process.stdout.write.bind(process.stdout);
++process.stdout.write = (chunk, ...rest) => {
++  log += String(chunk);
++  return writeStdout(chunk, ...rest);
++};
++const loggedFailure = (since = 0) => /^::(warning|error)::/m.test(log.slice(since));
++
++async function waitForEntry(path, key, since) {
++  for (let attempt = 0; attempt < LOOKUP_ATTEMPTS && !loggedFailure(since); ++attempt) {
++    if ((await cache.restoreCache([path], key, [], { lookupOnly: true })) === key) {
++      return true;
++    }
++    await new Promise((resolve) => setTimeout(resolve, LOOKUP_INTERVAL_MS));
++  }
++  return false;
++}
 +
 +let failures = 0;
 +switch (operation) {
-+  case 'restore': {
-+    // restoreCache() reports a failed request only as a workflow command, and otherwise returns as for a miss.
-+    const writeStdout = process.stdout.write.bind(process.stdout);
-+    process.stdout.write = (chunk, ...rest) => {
-+      if (/^::(warning|error)::/m.test(String(chunk))) {
-+        ++failures;
-+      }
-+      return writeStdout(chunk, ...rest);
-+    };
-+
++  case 'restore':
 +    await forEachLimited(entries, RESTORE_CONCURRENCY, async ({ key, path }) => {
++      // A failed request takes about 30 seconds of retries, and the remaining ones would likely fail too.
++      if (failures > 0 || loggedFailure()) {
++        return;
++      }
++
 +      try {
-+        await cache.restoreCache([path], key);
++        if ((await cache.restoreCache([path], key)) === key) {
++          return;
++        }
 +      } catch (error) {
 +        console.error(`warning: failed to restore ${key}: ${error.message}`);
 +        ++failures;
 +      }
++
++      // A failed extraction can leave part of the archive behind, which vcpkg would take for a hit.
++      rmSync(path, { force: true });
 +    });
++
++    // restoreCache() returns as for a miss when a request fails, and only logs the failure.
++    if (loggedFailure()) {
++      ++failures;
++    }
 +    break;
-+  }
 +  case 'save':
 +    for (const { key, path } of entries) {
++      const logStart = log.length;
 +      try {
 +        if ((await cache.saveCache([path], key)) !== -1) {
 +          continue;
 +        }
 +
-+        // Jobs that build the same package at once race to save it, and the loser finds the entry taken.
-+        if ((await cache.restoreCache([path], key, [], { lookupOnly: true })) === key) {
++        // Jobs that build the same package at once race to save it, and the loser waits for the winner's upload.
++        if (log.includes('Unable to reserve cache', logStart) && (await waitForEntry(path, key, log.length))) {
 +          console.log(`${key} is already stored`);
 +          continue;
 +        }
@@ -836,10 +871,10 @@ index 828ceab0..8a6abcc8 100644
      inline constexpr StringLiteral EnvironmentVariableAppData = "APPDATA";
      inline constexpr StringLiteral EnvironmentVariableAppveyor = "APPVEYOR";
 diff --git a/include/vcpkg/base/message-data.inc.h b/include/vcpkg/base/message-data.inc.h
-index 516d3d83..f78c98f1 100644
+index 516d3d83..55ee14ad 100644
 --- a/include/vcpkg/base/message-data.inc.h
 +++ b/include/vcpkg/base/message-data.inc.h
-@@ -1468,11 +1468,17 @@ DECLARE_MESSAGE(ForMoreHelp,
+@@ -1468,11 +1468,21 @@ DECLARE_MESSAGE(ForMoreHelp,
                  "Printed before a suggestion for the user to run `vcpkg help <topic>`",
                  "For More Help")
  DECLARE_MESSAGE(GetParseFailureInfo, (), "", "Use '--debug' to get more information about the parse failures.")
@@ -857,10 +892,14 @@ index 516d3d83..f78c98f1 100644
 +                "The x-gha binary source requires the ACTIONS_RUNTIME_TOKEN and ACTIONS_RESULTS_URL environment "
 +                "variables. GitHub Actions sets them only for JavaScript actions, so an earlier step of the job must "
 +                "make them available to later steps. See {url} for details.")
++DECLARE_MESSAGE(GhaUploadsStopped,
++                (),
++                "The term 'x-gha' is a vcpkg configuration option",
++                "x-gha will not upload the remaining packages of this run because an upload failed.")
  DECLARE_MESSAGE(GitCommitUpdateVersionDatabase,
                  (),
                  "This is a command line; only the 'update version database' part should be localized",
-@@ -1962,6 +1968,10 @@ DECLARE_MESSAGE(InvalidArgumentRequiresValidToken,
+@@ -1962,6 +1972,10 @@ DECLARE_MESSAGE(InvalidArgumentRequiresValidToken,
                  "",
                  "invalid argument: binary config '{binary_source}' requires a SAS token without a "
                  "preceeding '?' as the second argument")
@@ -871,7 +910,7 @@ index 516d3d83..f78c98f1 100644
  DECLARE_MESSAGE(
      InvalidBinaryCacheCompressionLevel,
      (msg::value),
-@@ -2763,6 +2773,10 @@ DECLARE_MESSAGE(RestoredPackagesFromGCS,
+@@ -2763,6 +2777,10 @@ DECLARE_MESSAGE(RestoredPackagesFromGCS,
                  (msg::count, msg::elapsed),
                  "",
                  "Restored {count} package(s) from GCS in {elapsed}. Use --debug to see more details.")
@@ -896,6 +935,18 @@ index a057e2f3..c073778a 100644
          std::vector<AzureUpkgSource> upkg_templates_to_get;
          std::vector<AzureUpkgSource> upkg_templates_to_put;
  
+diff --git a/include/vcpkg/metrics.h b/include/vcpkg/metrics.h
+index e81ea0c9..c7ca730b 100644
+--- a/include/vcpkg/metrics.h
++++ b/include/vcpkg/metrics.h
+@@ -23,6 +23,7 @@ namespace vcpkg
+         BinaryCachingDefault,
+         BinaryCachingFiles,
+         BinaryCachingGcs,
++        BinaryCachingGha,
+         BinaryCachingHttp,
+         BinaryCachingNuGet,
+         BinaryCachingSource,
 diff --git a/include/vcpkg/vcpkgcmdarguments.h b/include/vcpkg/vcpkgcmdarguments.h
 index 1234de81..6661a1ac 100644
 --- a/include/vcpkg/vcpkgcmdarguments.h
@@ -911,10 +962,10 @@ index 1234de81..6661a1ac 100644
          Optional<std::string> github_api_url;
          Optional<std::string> github_ref;
 diff --git a/locales/messages.json b/locales/messages.json
-index fcc7213d..f7b87fc1 100644
+index fcc7213d..ad5e0402 100644
 --- a/locales/messages.json
 +++ b/locales/messages.json
-@@ -872,8 +872,10 @@
+@@ -872,8 +872,12 @@
    "ForceSystemBinariesOnWeirdPlatforms": "Environment variable VCPKG_FORCE_SYSTEM_BINARIES must be set on arm, s390x, ppc64le and riscv platforms.",
    "FormattedParseMessageExpressionPrefix": "on expression:",
    "GetParseFailureInfo": "Use '--debug' to get more information about the parse failures.",
@@ -924,10 +975,12 @@ index fcc7213d..f7b87fc1 100644
 +  "_GhaAdapterUnavailable.comment": "The term 'x-gha' is a vcpkg configuration option",
 +  "GhaParametersMissing": "The x-gha binary source requires the ACTIONS_RUNTIME_TOKEN and ACTIONS_RESULTS_URL environment variables. GitHub Actions sets them only for JavaScript actions, so an earlier step of the job must make them available to later steps. See {url} for details.",
 +  "_GhaParametersMissing.comment": "The term 'x-gha' is a vcpkg configuration option An example of {url} is https://github.com/microsoft/vcpkg.",
++  "GhaUploadsStopped": "x-gha will not upload the remaining packages of this run because an upload failed.",
++  "_GhaUploadsStopped.comment": "The term 'x-gha' is a vcpkg configuration option",
    "GitCommitUpdateVersionDatabase": "git commit -m \"Update version database\"",
    "_GitCommitUpdateVersionDatabase.comment": "This is a command line; only the 'update version database' part should be localized",
    "GitRegistryMustHaveBaseline": "The git registry \"{url}\" must have a \"baseline\" field that is a valid git commit SHA (40 hexadecimal characters).\nTo use the current latest versions, set baseline to that repo's HEAD, \"{commit_sha}\".",
-@@ -1066,6 +1068,8 @@
+@@ -1066,6 +1070,8 @@
    "_InvalidArgumentRequiresTwoOrThreeArguments.comment": "An example of {binary_source} is azblob.",
    "InvalidArgumentRequiresValidToken": "invalid argument: binary config '{binary_source}' requires a SAS token without a preceeding '?' as the second argument",
    "_InvalidArgumentRequiresValidToken.comment": "An example of {binary_source} is azblob.",
@@ -936,7 +989,7 @@ index fcc7213d..f7b87fc1 100644
    "InvalidBinaryCacheCompressionLevel": "Invalid binary cache compression level '{value}'. --binary-cache-compression-level and VCPKG_BINARY_CACHE_COMPRESSION_LEVEL require a single digit (0-9).",
    "_InvalidBinaryCacheCompressionLevel.comment": "{value} is the supplied compression level.",
    "InvalidBuildInfo": "Invalid BUILD_INFO file for package: {error_msg}",
-@@ -1432,6 +1436,8 @@
+@@ -1432,6 +1438,8 @@
    "_RestoredPackagesFromFiles.comment": "An example of {count} is 42. An example of {elapsed} is 3.532 min. An example of {path} is /foo/bar.",
    "RestoredPackagesFromGCS": "Restored {count} package(s) from GCS in {elapsed}. Use --debug to see more details.",
    "_RestoredPackagesFromGCS.comment": "An example of {count} is 42. An example of {elapsed} is 3.532 min.",
@@ -1006,7 +1059,7 @@ index f6c611b0..8ee31755 100644
  {
      {
 diff --git a/src/vcpkg/binarycaching.cpp b/src/vcpkg/binarycaching.cpp
-index fb7fa5bd..0f0dcca0 100644
+index fb7fa5bd..75fb91d9 100644
 --- a/src/vcpkg/binarycaching.cpp
 +++ b/src/vcpkg/binarycaching.cpp
 @@ -20,6 +20,8 @@
@@ -1018,7 +1071,7 @@ index fb7fa5bd..0f0dcca0 100644
  #include <vcpkg/dependencies.h>
  #include <vcpkg/documentation.h>
  #include <vcpkg/metrics.h>
-@@ -1351,6 +1353,134 @@ namespace
+@@ -1351,6 +1353,174 @@ namespace
          Path m_tool;
      };
  
@@ -1049,8 +1102,9 @@ index fb7fa5bd..0f0dcca0 100644
 +            auto cmd = Command{m_node}.string_arg(m_script);
 +            RedirectedProcessLaunchSettings settings;
 +            settings.stdin_content = Json::stringify(request);
++            settings.echo_in_debug = EchoInDebug::Show;
 +            auto maybe_output = cmd_execute_and_capture_output(context, cmd, settings);
-+            return check_zero_exit_code(context, cmd, maybe_output, EchoInDebug::Show) != nullptr;
++            return check_zero_exit_code(context, cmd, maybe_output, settings.echo_in_debug) != nullptr;
 +        }
 +
 +    private:
@@ -1063,12 +1117,9 @@ index fb7fa5bd..0f0dcca0 100644
 +        return fmt::format("vcpkg-{}-{}", spec.name(), abi);
 +    }
 +
-+    // @actions/cache hashes this name into the cache version, so it must not depend on where vcpkg is. BinaryCache
-+    // creates the archive to push as package_dir + ".zip", which yields the same name.
-+    std::string make_gha_archive_name(const Path& package_dir)
-+    {
-+        return Strings::concat(package_dir.filename(), ".zip");
-+    }
++    // @actions/cache hashes this name into the cache version, so it must not depend on where vcpkg is or on the
++    // numbering that some commands add to package directories.
++    std::string make_gha_archive_name(StringView abi) { return Strings::concat(abi, ".zip"); }
 +
 +    struct GhaBinaryProvider : ZipReadBinaryProvider
 +    {
@@ -1094,8 +1145,8 @@ index fb7fa5bd..0f0dcca0 100644
 +            entries.reserve(actions.size());
 +            for (auto&& action : actions)
 +            {
-+                entries.emplace_back(make_gha_cache_key(action->spec, action->package_abi_or_exit(VCPKG_LINE_INFO)),
-+                                     make_gha_archive_name(action->package_dir));
++                const auto& abi = action->package_abi_or_exit(VCPKG_LINE_INFO);
++                entries.emplace_back(make_gha_cache_key(action->spec, abi), make_gha_archive_name(abi));
 +            }
 +
 +            // A failure for some entries still leaves the others usable.
@@ -1124,36 +1175,78 @@ index fb7fa5bd..0f0dcca0 100644
 +            return msg::format(msgRestoredPackagesFromGHA, msg::count = count, msg::elapsed = ElapsedTime(elapsed));
 +        }
 +
++    private:
 +        Path m_buildtrees;
 +        std::shared_ptr<const GhaCacheAdapter> m_adapter;
 +    };
 +
 +    struct GhaBinaryPushProvider : IWriteBinaryProvider
 +    {
-+        GhaBinaryPushProvider(std::shared_ptr<const GhaCacheAdapter> adapter) : m_adapter(std::move(adapter)) { }
++        GhaBinaryPushProvider(const Path& buildtrees, std::shared_ptr<const GhaCacheAdapter> adapter)
++            : m_buildtrees(buildtrees), m_adapter(std::move(adapter))
++        {
++        }
 +
 +        size_t push_success(DiagnosticContext& context,
-+                            const Filesystem&,
++                            const Filesystem& fs,
 +                            const BinaryPackageWriteInfo& request) override
 +        {
-+            if (!request.zip_path) return 0;
++            if (!request.zip_path || m_stopped) return 0;
 +            const auto& zip_path = *request.zip_path.get();
++            const auto directory = m_buildtrees / ".gha-push";
 +            const std::pair<std::string, std::string> entry{make_gha_cache_key(request.spec, request.package_abi),
-+                                                            zip_path.filename().to_string()};
++                                                            make_gha_archive_name(request.package_abi)};
++            const auto archive_path = directory / entry.second;
++
 +            WarningDiagnosticContext wdc{context};
-+            return m_adapter->run(wdc, "save", Path{zip_path.parent_path()}, {&entry, 1}) ? 1 : 0;
++            std::error_code ec;
++            fs.create_directories(directory, ec);
++            if (!ec)
++            {
++                fs.remove(archive_path, IgnoreErrors{});
++                fs.create_hard_link(zip_path, archive_path, ec);
++                if (ec)
++                {
++                    fs.copy_file(zip_path, archive_path, CopyOptions::overwrite_existing, ec);
++                }
++            }
++
++            if (ec)
++            {
++                wdc.report(DiagnosticLine{DiagKind::Warning,
++                                          msg::format(msgFailedToStoreBinaryCache, msg::path = archive_path)
++                                              .append_raw('\n')
++                                              .append_raw(ec.message())});
++                return 0;
++            }
++
++            const bool stored = m_adapter->run(wdc, "save", directory, {&entry, 1});
++            fs.remove(archive_path, IgnoreErrors{});
++            if (!stored)
++            {
++                // @actions/cache retries each request for about 30 seconds, so the remaining uploads would most
++                // likely stall the same way.
++                m_stopped = true;
++                wdc.report(DiagnosticLine{DiagKind::Warning, msg::format(msgGhaUploadsStopped)});
++                return 0;
++            }
++
++            return 1;
 +        }
 +
 +        bool needs_nuspec_data() const override { return false; }
 +        bool needs_zip_file() const override { return true; }
 +
++    private:
++        Path m_buildtrees;
 +        std::shared_ptr<const GhaCacheAdapter> m_adapter;
++        bool m_stopped = false;
 +    };
 +
      struct GcsStorageTool : IObjectStorageTool
      {
          GcsStorageTool(const Path& tool) : m_tool(tool) { }
-@@ -2167,7 +2297,16 @@ namespace
+@@ -2167,7 +2337,16 @@ namespace
              }
              else if (segments[0].second == "x-gha")
              {
@@ -1171,15 +1264,24 @@ index fb7fa5bd..0f0dcca0 100644
              }
              else if (segments[0].second == "http")
              {
-@@ -2795,10 +2934,47 @@ namespace vcpkg
+@@ -2718,6 +2897,7 @@ namespace vcpkg
+                 {"default", DefineMetric::BinaryCachingDefault},
+                 {"files", DefineMetric::BinaryCachingFiles},
+                 {"gcs", DefineMetric::BinaryCachingGcs},
++                {"gha", DefineMetric::BinaryCachingGha},
+                 {"http", DefineMetric::BinaryCachingHttp},
+                 {"nuget", DefineMetric::BinaryCachingNuGet},
+                 {"upkg", DefineMetric::BinaryCachingUpkg},
+@@ -2795,10 +2975,48 @@ namespace vcpkg
                      return false;
                  }
              }
 +            std::shared_ptr<const GhaCacheAdapter> gha_adapter;
 +            if (s.gha_read || s.gha_write)
 +            {
-+                if (!args.actions_runtime_token.has_value() ||
-+                    !(args.actions_results_url.has_value() || args.actions_cache_url.has_value()))
++                const auto is_set = [](const Optional<std::string>& value) { return !value.value_or("").empty(); };
++                if (!is_set(args.actions_runtime_token) ||
++                    !(is_set(args.actions_results_url) || is_set(args.actions_cache_url)))
 +                {
 +                    context.report_error(msg::format(msgGhaParametersMissing, msg::url = docs::binarycaching_url));
 +                    return false;
@@ -1220,7 +1322,7 @@ index fb7fa5bd..0f0dcca0 100644
              {
                  ZipTool zip_tool;
                  if (!zip_tool.setup(context, fs, tools))
-@@ -2856,6 +3032,11 @@ namespace vcpkg
+@@ -2856,6 +3074,11 @@ namespace vcpkg
                      m_config.read.push_back(
                          std::make_unique<AzCopyStorageProvider>(zip_tool, buildtrees, std::move(prefix), azcopy_tool));
                  }
@@ -1232,17 +1334,29 @@ index fb7fa5bd..0f0dcca0 100644
              }
              if (!s.upkg_templates_to_put.empty())
              {
-@@ -2898,6 +3079,10 @@ namespace vcpkg
+@@ -2898,6 +3121,10 @@ namespace vcpkg
                  m_config.write.push_back(
                      std::make_unique<ObjectStoragePushProvider>(std::move(s.cos_write_prefixes), cos_tool));
              }
 +            if (s.gha_write)
 +            {
-+                m_config.write.push_back(std::make_unique<GhaBinaryPushProvider>(gha_adapter));
++                m_config.write.push_back(std::make_unique<GhaBinaryPushProvider>(buildtrees, gha_adapter));
 +            }
  
              if (!s.sources_to_read.empty() || !s.configs_to_read.empty() || !s.sources_to_write.empty() ||
                  !s.configs_to_write.empty())
+diff --git a/src/vcpkg/metrics.cpp b/src/vcpkg/metrics.cpp
+index ab1ed93d..f90e467e 100644
+--- a/src/vcpkg/metrics.cpp
++++ b/src/vcpkg/metrics.cpp
+@@ -114,6 +114,7 @@ namespace vcpkg
+         {DefineMetric::BinaryCachingDefault, "binarycaching_default"},
+         {DefineMetric::BinaryCachingFiles, "binarycaching_files"},
+         {DefineMetric::BinaryCachingGcs, "binarycaching_gcs"},
++        {DefineMetric::BinaryCachingGha, "binarycaching_gha"},
+         {DefineMetric::BinaryCachingHttp, "binarycaching_http"},
+         {DefineMetric::BinaryCachingNuGet, "binarycaching_nuget"},
+         {DefineMetric::BinaryCachingSource, "binarycaching-source"},
 diff --git a/src/vcpkg/vcpkgcmdarguments.cpp b/src/vcpkg/vcpkgcmdarguments.cpp
 index a485e252..e8c1a8a6 100644
 --- a/src/vcpkg/vcpkgcmdarguments.cpp
