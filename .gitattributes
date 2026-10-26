@@ -29,3 +29,6 @@ COPYING text
 *.png binary
 *.woff binary
 *.woff2 binary
+
+# Patches must apply byte for byte
+*.patch -text
