@@ -1,0 +1,1274 @@
+diff --git i/.gitignore w/.gitignore
+index 72e35229..0846e07b 100644
+--- i/.gitignore
++++ w/.gitignore
+@@ -13,5 +13,6 @@ CMakeLists.txt.user
+ /cmake-build-*
+ /out
+ /vcpkg-artifacts/node_modules/
++/github-actions-cache-adapter/node_modules/
+ /vcpkg-root
+ /work
+diff --git i/CMakeLists.txt w/CMakeLists.txt
+index 68659522..3aa73121 100644
+--- i/CMakeLists.txt
++++ w/CMakeLists.txt
+@@ -293,7 +293,14 @@ elseif(VCPKG_OFFICIAL_BUILD)
+     message(FATAL_ERROR "VCPKG_ARTIFACTS_SHA is required for official builds.")
+ endif()
+ 
++if(VCPKG_GITHUB_ACTIONS_CACHE_ADAPTER_SHA)
++    target_compile_definitions(vcpkglib PUBLIC
++        "VCPKG_GITHUB_ACTIONS_CACHE_ADAPTER_SHA=${VCPKG_GITHUB_ACTIONS_CACHE_ADAPTER_SHA}"
++    )
++endif()
++
+ file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg-artifacts" VCPKG_ARTIFACTS_SOURCE_DIR)
++file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/github-actions-cache-adapter" GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR)
+ if (VCPKG_ARTIFACTS_DEVELOPMENT)
+     # The directory constructed by this portion of the build script needs to be kept in sync with
+     # that created by azure-pipelines/signing.yml
+@@ -395,6 +402,46 @@ if (VCPKG_ARTIFACTS_DEVELOPMENT)
+         )
+ 
+     add_custom_target(vcpkg-artifacts-target ALL DEPENDS "${VCPKG_ARTIFACTS_BINARY}")
++
++# === Target: github-actions-cache-adapter-target ===
++    add_custom_command(
++        OUTPUT
++            "${GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR}/node_modules"
++        COMMAND "${NPM}" ARGS "ci" "--include=dev"
++        WORKING_DIRECTORY
++            "${GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR}"
++        COMMENT
++            "Running npm install for github-actions-cache-adapter..."
++        MAIN_DEPENDENCY
++            "${GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR}/package-lock.json"
++        VERBATIM
++        )
++
++    set(GITHUB_ACTIONS_CACHE_ADAPTER_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/github-actions-cache-adapter-build")
++    set(GITHUB_ACTIONS_CACHE_ADAPTER_BINARY "${CMAKE_CURRENT_BINARY_DIR}/github-actions-cache-adapter.mjs")
++    add_custom_command(
++        OUTPUT
++            "${GITHUB_ACTIONS_CACHE_ADAPTER_BINARY}"
++        COMMAND
++            "${NODEJS}" ARGS "${GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR}/node_modules/@vercel/ncc/dist/ncc/cli.js"
++                build "main.mjs"
++                --out "${GITHUB_ACTIONS_CACHE_ADAPTER_BUILD_DIR}"
++        COMMAND
++            "${CMAKE_COMMAND}" ARGS -E copy "${GITHUB_ACTIONS_CACHE_ADAPTER_BUILD_DIR}/index.mjs" "${GITHUB_ACTIONS_CACHE_ADAPTER_BINARY}"
++        WORKING_DIRECTORY
++            "${GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR}"
++        DEPENDS
++            "${GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR}/node_modules"
++            "${GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR}/main.mjs"
++            "${GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR}/package.json"
++            "${GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR}/package-lock.json"
++            "${GITHUB_ACTIONS_CACHE_ADAPTER_SOURCE_DIR}/.npmrc"
++        COMMENT
++            "Building github-actions-cache-adapter..."
++        VERBATIM
++        )
++
++    add_custom_target(github-actions-cache-adapter-target ALL DEPENDS "${GITHUB_ACTIONS_CACHE_ADAPTER_BINARY}")
+ endif()
+ 
+ set(CPP_ATOMIC_LIBRARY "")
+diff --git i/github-actions-cache-adapter/.npmrc w/github-actions-cache-adapter/.npmrc
+new file mode 100644
+index 00000000..86d9c31a
+--- /dev/null
++++ w/github-actions-cache-adapter/.npmrc
+@@ -0,0 +1 @@
++registry=https://pkgs.dev.azure.com/vcpkg/public/_packaging/vcpkg-ecmascript-dependencies/npm/registry/
+diff --git i/github-actions-cache-adapter/main.mjs w/github-actions-cache-adapter/main.mjs
+new file mode 100644
+index 00000000..8ef40ebb
+--- /dev/null
++++ w/github-actions-cache-adapter/main.mjs
+@@ -0,0 +1,100 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT License.
++
++// Connects vcpkg's x-gha binary source to the GitHub Actions cache. GitHub supports only @actions/cache as a
++// client for that service, so vcpkg runs this script instead of calling the service itself.
++//
++// vcpkg writes one request to stdin:
++//   {"operation": "restore" | "save", "directory": "<absolute path>", "entries": [{"key": "...", "path": "..."}]}
++//
++// Each path is a file name relative to directory. @actions/cache hashes the paths it is given into the cache
++// version, so passing relative paths lets machines that keep vcpkg in different places share entries.
++//
++// restore: downloads every entry that exists into directory; vcpkg checks which files arrived. Misses are not
++//          errors, but exits with a nonzero code if a lookup or download failed.
++// save: uploads every entry. Exits with a nonzero code if any of them is not in the cache afterwards.
++//
++// @actions/cache logs to stdout, which vcpkg shows only with --debug or when this script fails.
++
++import * as cache from '@actions/cache';
++import { text } from 'node:stream/consumers';
++
++const RESTORE_CONCURRENCY = 8;
++
++async function forEachLimited(items, limit, work) {
++  let next = 0;
++  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
++    while (next < items.length) {
++      await work(items[next++]);
++    }
++  });
++  await Promise.all(workers);
++}
++
++const request = JSON.parse(await text(process.stdin));
++const { operation, directory, entries } = request;
++if (typeof directory !== 'string' || !Array.isArray(entries)) {
++  console.error('error: the request needs a directory and an array of entries');
++  process.exit(2);
++}
++
++// The runner sets ACTIONS_CACHE_SERVICE_V2 only for JavaScript actions, and the step that exposes the other
++// variables to run steps may not forward it. github.com no longer serves the v1 protocol, so pick v2 whenever its
++// URL is present. On GitHub Enterprise Server, @actions/cache uses v1 regardless.
++if (process.env.ACTIONS_RESULTS_URL && !process.env.ACTIONS_CACHE_SERVICE_V2) {
++  process.env.ACTIONS_CACHE_SERVICE_V2 = 'true';
++}
++
++// @actions/cache stores and extracts paths relative to GITHUB_WORKSPACE.
++process.chdir(directory);
++process.env.GITHUB_WORKSPACE = directory;
++
++let failures = 0;
++switch (operation) {
++  case 'restore': {
++    // restoreCache() returns the same thing for a miss and for a failed request, and reports failures only as
++    // workflow commands on stdout, so count those to keep a broken setup from looking like an empty cache.
++    const writeStdout = process.stdout.write.bind(process.stdout);
++    process.stdout.write = (chunk, ...rest) => {
++      if (/^::(warning|error)::/m.test(String(chunk))) {
++        ++failures;
++      }
++      return writeStdout(chunk, ...rest);
++    };
++
++    await forEachLimited(entries, RESTORE_CONCURRENCY, async ({ key, path }) => {
++      try {
++        await cache.restoreCache([path], key);
++      } catch (error) {
++        console.error(`warning: failed to restore ${key}: ${error.message}`);
++        ++failures;
++      }
++    });
++    break;
++  }
++  case 'save':
++    for (const { key, path } of entries) {
++      try {
++        if ((await cache.saveCache([path], key)) !== -1) {
++          continue;
++        }
++
++        // Jobs that build the same package at the same time race to save it, and the loser cannot store an entry
++        // that already exists.
++        if ((await cache.restoreCache([path], key, [], { lookupOnly: true })) === key) {
++          console.log(`${key} is already stored`);
++          continue;
++        }
++      } catch (error) {
++        console.error(`warning: failed to save ${key}: ${error.message}`);
++      }
++
++      ++failures;
++    }
++    break;
++  default:
++    console.error(`error: unknown operation '${operation}'`);
++    process.exit(2);
++}
++
++process.exit(failures === 0 ? 0 : 1);
+diff --git i/github-actions-cache-adapter/package-lock.json w/github-actions-cache-adapter/package-lock.json
+new file mode 100644
+index 00000000..d89c43a8
+--- /dev/null
++++ w/github-actions-cache-adapter/package-lock.json
+@@ -0,0 +1,600 @@
++{
++  "name": "github-actions-cache-adapter",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "github-actions-cache-adapter",
++      "license": "MIT",
++      "dependencies": {
++        "@actions/cache": "^6.3.0"
++      },
++      "devDependencies": {
++        "@vercel/ncc": "^0.38.3"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@actions/cache": {
++      "version": "6.3.0",
++      "resolved": "https://registry.npmjs.org/@actions/cache/-/cache-6.3.0.tgz",
++      "integrity": "sha512-SJKaVMqTgetQgJF0wifi5N2+2mffCLy/D4w/3sJtRanBBGECdi1/OD0wswyLVmqEmPbYB/rVJk41Qn/xEbFjAw==",
++      "license": "MIT",
++      "dependencies": {
++        "@actions/core": "^3.0.1",
++        "@actions/exec": "^3.0.0",
++        "@actions/glob": "^0.7.0",
++        "@actions/http-client": "^4.0.1",
++        "@actions/io": "^3.0.2",
++        "@azure/core-rest-pipeline": "~1.23.0",
++        "@azure/storage-blob": "~12.31.0",
++        "@protobuf-ts/runtime-rpc": "^2.11.1",
++        "semver": "^7.8.5"
++      }
++    },
++    "node_modules/@actions/core": {
++      "version": "3.0.1",
++      "resolved": "https://registry.npmjs.org/@actions/core/-/core-3.0.1.tgz",
++      "integrity": "sha512-a6d/Nwahm9fliVGRhdhofo40HjHQasUPusmc7vBfyky+7Z+P2A1J68zyFVaNcEclc/Se+eO595oAr5nwEIoIUA==",
++      "license": "MIT",
++      "dependencies": {
++        "@actions/exec": "^3.0.0",
++        "@actions/http-client": "^4.0.0"
++      }
++    },
++    "node_modules/@actions/exec": {
++      "version": "3.0.0",
++      "resolved": "https://registry.npmjs.org/@actions/exec/-/exec-3.0.0.tgz",
++      "integrity": "sha512-6xH/puSoNBXb72VPlZVm7vQ+svQpFyA96qdDBvhB8eNZOE8LtPf9L4oAsfzK/crCL8YZ+19fKYVnM63Sl+Xzlw==",
++      "license": "MIT",
++      "dependencies": {
++        "@actions/io": "^3.0.2"
++      }
++    },
++    "node_modules/@actions/glob": {
++      "version": "0.7.0",
++      "resolved": "https://registry.npmjs.org/@actions/glob/-/glob-0.7.0.tgz",
++      "integrity": "sha512-+7s3wM+cXapDLmLL1NVWHawqcJOZzXZy2df/VhNn8DnZtS/x83iTCKaUn9F0llur4h3CII0AilvKKH4CMPL8Gw==",
++      "license": "MIT",
++      "dependencies": {
++        "@actions/core": "^3.0.0",
++        "minimatch": "^10.2.5"
++      }
++    },
++    "node_modules/@actions/http-client": {
++      "version": "4.0.1",
++      "resolved": "https://registry.npmjs.org/@actions/http-client/-/http-client-4.0.1.tgz",
++      "integrity": "sha512-+Nvd1ImaOZBSoPbsUtEhv+1z99H12xzncCkz0a3RuehINE81FZSe2QTj3uvAPTcJX/SCzUQHQ0D1GrPMbrPitg==",
++      "license": "MIT",
++      "dependencies": {
++        "tunnel": "^0.0.6",
++        "undici": "^6.23.0"
++      }
++    },
++    "node_modules/@actions/io": {
++      "version": "3.0.2",
++      "resolved": "https://registry.npmjs.org/@actions/io/-/io-3.0.2.tgz",
++      "integrity": "sha512-nRBchcMM+QK1pdjO7/idu86rbJI5YHUKCvKs0KxnSYbVe3F51UfGxuZX4Qy/fWlp6l7gWFwIkrOzN+oUK03kfw==",
++      "license": "MIT"
++    },
++    "node_modules/@azure/abort-controller": {
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/@azure/abort-controller/-/abort-controller-2.2.0.tgz",
++      "integrity": "sha512-fNAjWnA/nZ2jz31kxR/AqRaUT8ewHBw/WuBIosK0moMy1C9e5ValbDfFdIxJzVOOYaYkV/b2F1S4H/aHiqfVQg==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@azure/core-auth": {
++      "version": "1.11.0",
++      "resolved": "https://registry.npmjs.org/@azure/core-auth/-/core-auth-1.11.0.tgz",
++      "integrity": "sha512-IUZydyTUkDnYdstOW9pFOOUQlBjAepK5teihDE3x6yxsPJs/hsAaaYpeGxdxrgtOiJbBKSjKW7MDk7AEhb4LRg==",
++      "license": "MIT",
++      "dependencies": {
++        "@azure/abort-controller": "^2.1.2",
++        "@azure/core-util": "^1.13.0",
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@azure/core-client": {
++      "version": "1.11.1",
++      "resolved": "https://registry.npmjs.org/@azure/core-client/-/core-client-1.11.1.tgz",
++      "integrity": "sha512-2QygG2F76ZpMP2eMztiJvAiFMu71M9rDeU7vO/QKg5Css7MgM4frUOslFjhVjRhbGaCNPtz/S8M6y46/fFKVuQ==",
++      "license": "MIT",
++      "dependencies": {
++        "@azure/abort-controller": "^2.1.2",
++        "@azure/core-auth": "^1.10.0",
++        "@azure/core-rest-pipeline": "^1.22.0",
++        "@azure/core-tracing": "^1.3.0",
++        "@azure/core-util": "^1.13.0",
++        "@azure/logger": "^1.3.0",
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@azure/core-http-compat": {
++      "version": "2.5.0",
++      "resolved": "https://registry.npmjs.org/@azure/core-http-compat/-/core-http-compat-2.5.0.tgz",
++      "integrity": "sha512-BoSmXPx2er1Ai+wKlDvj29jIQespCNBwEmKyZVHO2kEFsWbGjAjwMCGzug3DJM5/QYIV3vej0S1zcU5bq9fa8w==",
++      "license": "MIT",
++      "dependencies": {
++        "@azure/abort-controller": "^2.1.2"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      },
++      "peerDependencies": {
++        "@azure/core-client": "^1.10.0",
++        "@azure/core-rest-pipeline": "^1.22.0"
++      }
++    },
++    "node_modules/@azure/core-lro": {
++      "version": "2.7.2",
++      "resolved": "https://registry.npmjs.org/@azure/core-lro/-/core-lro-2.7.2.tgz",
++      "integrity": "sha512-0YIpccoX8m/k00O7mDDMdJpbr6mf1yWo2dfmxt5A8XVZVVMz2SSKaEbMCeJRvgQ0IaSlqhjT47p4hVIRRy90xw==",
++      "license": "MIT",
++      "dependencies": {
++        "@azure/abort-controller": "^2.0.0",
++        "@azure/core-util": "^1.2.0",
++        "@azure/logger": "^1.0.0",
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=18.0.0"
++      }
++    },
++    "node_modules/@azure/core-paging": {
++      "version": "1.7.0",
++      "resolved": "https://registry.npmjs.org/@azure/core-paging/-/core-paging-1.7.0.tgz",
++      "integrity": "sha512-7GEAoIsaoBr6KELNRb8nypowCqvk8dnCHFCYg4XD4lOQGY2GqjQg5IhkRjyBFRO18CGSMq05PaNqSOE9GQro3g==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@azure/core-rest-pipeline": {
++      "version": "1.23.0",
++      "resolved": "https://registry.npmjs.org/@azure/core-rest-pipeline/-/core-rest-pipeline-1.23.0.tgz",
++      "integrity": "sha512-Evs1INHo+jUjwHi1T6SG6Ua/LHOQBCLuKEEE6efIpt4ZOoNonaT1kP32GoOcdNDbfqsD2445CPri3MubBy5DEQ==",
++      "license": "MIT",
++      "dependencies": {
++        "@azure/abort-controller": "^2.1.2",
++        "@azure/core-auth": "^1.10.0",
++        "@azure/core-tracing": "^1.3.0",
++        "@azure/core-util": "^1.13.0",
++        "@azure/logger": "^1.3.0",
++        "@typespec/ts-http-runtime": "^0.3.4",
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=20.0.0"
++      }
++    },
++    "node_modules/@azure/core-tracing": {
++      "version": "1.4.0",
++      "resolved": "https://registry.npmjs.org/@azure/core-tracing/-/core-tracing-1.4.0.tgz",
++      "integrity": "sha512-eGwxD0AtncrxeBM4tG8R55Pc3rdX1hNW2WibJAgYpCVA6E93mvvVH+LcssoVjOBrSKWS55yEIHsk0X8ctHmfOQ==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@azure/core-util": {
++      "version": "1.14.0",
++      "resolved": "https://registry.npmjs.org/@azure/core-util/-/core-util-1.14.0.tgz",
++      "integrity": "sha512-9n2pWK61veAuN0V20t9lOuoV4CFMdyAZ1ygZzvBGk/pBBJRib/PjL9PLXa/aI2CcPpyHfqVsxxqLCYl6uZlfDw==",
++      "license": "MIT",
++      "dependencies": {
++        "@azure/abort-controller": "^2.1.2",
++        "@typespec/ts-http-runtime": "^0.3.0",
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@azure/core-xml": {
++      "version": "1.6.0",
++      "resolved": "https://registry.npmjs.org/@azure/core-xml/-/core-xml-1.6.0.tgz",
++      "integrity": "sha512-e7lX/dk//F6Qf7BB6PTY4+p2yuOQtyOeHGyapYHNwqSp2OnYpwQt49A/Nin2XmKBQ69pwagR4k/lQBq8lbHQkA==",
++      "license": "MIT",
++      "dependencies": {
++        "fast-xml-parser": "^5.5.9",
++        "tslib": "^2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@azure/logger": {
++      "version": "1.4.0",
++      "resolved": "https://registry.npmjs.org/@azure/logger/-/logger-1.4.0.tgz",
++      "integrity": "sha512-rbAE25KUfjU/s3XHUdJgceoCP5dEOpMx85J04kF+QMdta73XkuG9JGHHinch+XIoKpBdqljin+KqURpJriSzLA==",
++      "license": "MIT",
++      "dependencies": {
++        "@typespec/ts-http-runtime": "^0.3.0",
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@azure/storage-blob": {
++      "version": "12.31.0",
++      "resolved": "https://registry.npmjs.org/@azure/storage-blob/-/storage-blob-12.31.0.tgz",
++      "integrity": "sha512-DBgNv10aCSxopt92DkTDD0o9xScXeBqPKGmR50FPZQaEcH4JLQ+GEOGEDv19V5BMkB7kxr+m4h6il/cCDPvmHg==",
++      "license": "MIT",
++      "dependencies": {
++        "@azure/abort-controller": "^2.1.2",
++        "@azure/core-auth": "^1.9.0",
++        "@azure/core-client": "^1.9.3",
++        "@azure/core-http-compat": "^2.2.0",
++        "@azure/core-lro": "^2.2.0",
++        "@azure/core-paging": "^1.6.2",
++        "@azure/core-rest-pipeline": "^1.19.1",
++        "@azure/core-tracing": "^1.2.0",
++        "@azure/core-util": "^1.11.0",
++        "@azure/core-xml": "^1.4.5",
++        "@azure/logger": "^1.1.4",
++        "@azure/storage-common": "^12.3.0",
++        "events": "^3.0.0",
++        "tslib": "^2.8.1"
++      },
++      "engines": {
++        "node": ">=20.0.0"
++      }
++    },
++    "node_modules/@azure/storage-common": {
++      "version": "12.5.0",
++      "resolved": "https://registry.npmjs.org/@azure/storage-common/-/storage-common-12.5.0.tgz",
++      "integrity": "sha512-bttzuhQiCIwrkzjPDA+AtAR7dg19L/CC6ztcqJ5LfvWpXuys9mHp0UQ0udYnoUvv9SCT9KTR5kqFvFr0e6k0lQ==",
++      "license": "MIT",
++      "dependencies": {
++        "@azure/abort-controller": "^2.1.2",
++        "@azure/core-auth": "^1.9.0",
++        "@azure/core-http-compat": "^2.4.0",
++        "@azure/core-rest-pipeline": "^1.24.0",
++        "@azure/core-tracing": "^1.2.0",
++        "@azure/core-util": "^1.11.0",
++        "@azure/logger": "^1.1.4",
++        "events": "^3.3.0",
++        "tslib": "^2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@azure/storage-common/node_modules/@azure/core-rest-pipeline": {
++      "version": "1.25.0",
++      "resolved": "https://registry.npmjs.org/@azure/core-rest-pipeline/-/core-rest-pipeline-1.25.0.tgz",
++      "integrity": "sha512-bMs8ekJLjX8wPV+9IPBges1SLPyuDtE9g5gLDWOpxzKcoOFQnpLGkbcT1tdw3FaAmDS1gnPmMmJ6y/T5B96kIA==",
++      "license": "MIT",
++      "dependencies": {
++        "@azure/abort-controller": "^2.1.2",
++        "@azure/core-auth": "^1.10.0",
++        "@azure/core-tracing": "^1.3.0",
++        "@azure/core-util": "^1.13.0",
++        "@azure/logger": "^1.3.0",
++        "@typespec/ts-http-runtime": "^0.3.4",
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@nodable/entities": {
++      "version": "3.1.0",
++      "resolved": "https://registry.npmjs.org/@nodable/entities/-/entities-3.1.0.tgz",
++      "integrity": "sha512-LsS/DjHr+uDM647Gru/cA8+J3a3HfhttwCKLyuoyN7yXTFCxKBtSgMQBvrW9yNPa2/zDRUNuGPaH5QUFoa4arQ==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/nodable"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/@protobuf-ts/runtime": {
++      "version": "2.11.1",
++      "resolved": "https://registry.npmjs.org/@protobuf-ts/runtime/-/runtime-2.11.1.tgz",
++      "integrity": "sha512-KuDaT1IfHkugM2pyz+FwiY80ejWrkH1pAtOBOZFuR6SXEFTsnb/jiQWQ1rCIrcKx2BtyxnxW6BWwsVSA/Ie+WQ==",
++      "license": "(Apache-2.0 AND BSD-3-Clause)"
++    },
++    "node_modules/@protobuf-ts/runtime-rpc": {
++      "version": "2.11.1",
++      "resolved": "https://registry.npmjs.org/@protobuf-ts/runtime-rpc/-/runtime-rpc-2.11.1.tgz",
++      "integrity": "sha512-4CqqUmNA+/uMz00+d3CYKgElXO9VrEbucjnBFEjqI4GuDrEQ32MaI3q+9qPBvIGOlL4PmHXrzM32vBPWRhQKWQ==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "@protobuf-ts/runtime": "^2.11.1"
++      }
++    },
++    "node_modules/@typespec/ts-http-runtime": {
++      "version": "0.3.9",
++      "resolved": "https://registry.npmjs.org/@typespec/ts-http-runtime/-/ts-http-runtime-0.3.9.tgz",
++      "integrity": "sha512-edSdeAqkdxBVzA1yL1LrLCml1YjyCVvPMtMqJpbF+6K609tHe8V6sQUzFQSGcYNhcuhOceZtjvN32+mpIth30A==",
++      "license": "MIT",
++      "dependencies": {
++        "http-proxy-agent": "^7.0.0",
++        "https-proxy-agent": "^7.0.0",
++        "tslib": "^2.6.2"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@vercel/ncc": {
++      "version": "0.38.4",
++      "resolved": "https://registry.npmjs.org/@vercel/ncc/-/ncc-0.38.4.tgz",
++      "integrity": "sha512-8LwjnlP39s08C08J5NstzriPvW1SP8Zfpp1BvC2sI35kPeZnHfxVkCwu4/+Wodgnd60UtT1n8K8zw+Mp7J9JmQ==",
++      "dev": true,
++      "license": "MIT",
++      "bin": {
++        "ncc": "dist/ncc/cli.js"
++      }
++    },
++    "node_modules/agent-base": {
++      "version": "7.1.4",
++      "resolved": "https://registry.npmjs.org/agent-base/-/agent-base-7.1.4.tgz",
++      "integrity": "sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/anynum": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/anynum/-/anynum-1.0.1.tgz",
++      "integrity": "sha512-N6//FLET/tXYNM/F6ABca1oH6fWB+KlTt909Le28WMDBk8oaT4vY17DCrwg2MvmuqUKt3Ni4N5dGJ/EoBgcO6A==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/NaturalIntelligence"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/balanced-match": {
++      "version": "4.0.4",
++      "resolved": "https://registry.npmjs.org/balanced-match/-/balanced-match-4.0.4.tgz",
++      "integrity": "sha512-BLrgEcRTwX2o6gGxGOCNyMvGSp35YofuYzw9h1IMTRmKqttAZZVU67bdb9Pr2vUHA8+j3i2tJfjO6C6+4myGTA==",
++      "license": "MIT",
++      "engines": {
++        "node": "18 || 20 || >=22"
++      }
++    },
++    "node_modules/brace-expansion": {
++      "version": "5.0.12",
++      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.12.tgz",
++      "integrity": "sha512-YovQ3rzhaLMIrDjNDMkNS01tea93qhEhG5xy8f6+R0l+dw3Ki+5sCoIoI942iuLZTHWogWktgwVDhU09iNEimQ==",
++      "license": "MIT",
++      "dependencies": {
++        "balanced-match": "^4.0.2"
++      },
++      "engines": {
++        "node": "20 || >=22"
++      }
++    },
++    "node_modules/debug": {
++      "version": "4.4.3",
++      "resolved": "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz",
++      "integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==",
++      "license": "MIT",
++      "dependencies": {
++        "ms": "^2.1.3"
++      },
++      "engines": {
++        "node": ">=6.0"
++      },
++      "peerDependenciesMeta": {
++        "supports-color": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/events": {
++      "version": "3.3.0",
++      "resolved": "https://registry.npmjs.org/events/-/events-3.3.0.tgz",
++      "integrity": "sha512-mQw+2fkQbALzQ7V0MY0IqdnXNOeTtP4r0lN9z7AAawCXgqea7bDii20AYrIBrFd/Hx0M2Ocz6S111CaFkUcb0Q==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.8.x"
++      }
++    },
++    "node_modules/fast-xml-builder": {
++      "version": "1.3.1",
++      "resolved": "https://registry.npmjs.org/fast-xml-builder/-/fast-xml-builder-1.3.1.tgz",
++      "integrity": "sha512-pIM/1n3ntFXKYrUZwW7QCK0gAW7XY+wzj1YMIV3tLDvPj/V+zTGJK5e3/4WJfwj0qWw2ElNXiTixda/R+3YSug==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/NaturalIntelligence"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "path-expression-matcher": "^1.6.2",
++        "xml-naming": "^0.3.0"
++      }
++    },
++    "node_modules/fast-xml-parser": {
++      "version": "5.11.2",
++      "resolved": "https://registry.npmjs.org/fast-xml-parser/-/fast-xml-parser-5.11.2.tgz",
++      "integrity": "sha512-R9iDuNrQYeQut46cn2r2wHKn4HYzVDvDm5J1wW+koZewykv0yuO2HChTYeZtrULyHIDM9cj9TUXloCsueCQUog==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/NaturalIntelligence"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "@nodable/entities": "^3.0.1",
++        "fast-xml-builder": "^1.2.0",
++        "is-unsafe": "^2.0.0",
++        "path-expression-matcher": "^1.6.2",
++        "strnum": "^2.4.2",
++        "xml-naming": "^0.3.0"
++      },
++      "bin": {
++        "fxparser": "src/cli/cli.js"
++      }
++    },
++    "node_modules/http-proxy-agent": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/http-proxy-agent/-/http-proxy-agent-7.0.2.tgz",
++      "integrity": "sha512-T1gkAiYYDWYx3V5Bmyu7HcfcvL7mUrTWiM6yOfa3PIphViJ/gFPbvidQ+veqSOHci/PxBcDabeUNCzpOODJZig==",
++      "license": "MIT",
++      "dependencies": {
++        "agent-base": "^7.1.0",
++        "debug": "^4.3.4"
++      },
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/https-proxy-agent": {
++      "version": "7.0.6",
++      "resolved": "https://registry.npmjs.org/https-proxy-agent/-/https-proxy-agent-7.0.6.tgz",
++      "integrity": "sha512-vK9P5/iUfdl95AI+JVyUuIcVtd4ofvtrOr3HNtM2yxC9bnMbEdp3x01OhQNnjb8IJYi38VlTE3mBXwcfvywuSw==",
++      "license": "MIT",
++      "dependencies": {
++        "agent-base": "^7.1.2",
++        "debug": "4"
++      },
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/is-unsafe": {
++      "version": "2.0.2",
++      "resolved": "https://registry.npmjs.org/is-unsafe/-/is-unsafe-2.0.2.tgz",
++      "integrity": "sha512-HgbIHPBH0KHHCcjLfGsCvhtPTVxjaAZlXjwdz7/GQC40SjSe4sfQsar8J5VFo8JOSbarkpV0OLG95bbaNd9aAQ==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/NaturalIntelligence"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/minimatch": {
++      "version": "10.2.6",
++      "resolved": "https://registry.npmjs.org/minimatch/-/minimatch-10.2.6.tgz",
++      "integrity": "sha512-vpLQEs+VLCr1nU0BXS07maYoFwlDAH0gngQuuttxIwutDFEMHq2blX+8vpgxDdK3J1PwjCJiep77OitTZ4Ll1A==",
++      "license": "BlueOak-1.0.0",
++      "dependencies": {
++        "brace-expansion": "^5.0.8"
++      },
++      "engines": {
++        "node": "18 || 20 || >=22"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/isaacs"
++      }
++    },
++    "node_modules/ms": {
++      "version": "2.1.3",
++      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
++      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
++      "license": "MIT"
++    },
++    "node_modules/path-expression-matcher": {
++      "version": "1.6.2",
++      "resolved": "https://registry.npmjs.org/path-expression-matcher/-/path-expression-matcher-1.6.2.tgz",
++      "integrity": "sha512-enSlaiat05iasnzmgNxRj8reFdj3puY2QpNgP1aPIaVfT6nn9ICuPoFlKHk8EN22HcwewshO+mN2DGbkCEOtqQ==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/NaturalIntelligence"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=14.0.0"
++      }
++    },
++    "node_modules/semver": {
++      "version": "7.8.5",
++      "resolved": "https://registry.npmjs.org/semver/-/semver-7.8.5.tgz",
++      "integrity": "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==",
++      "license": "ISC",
++      "bin": {
++        "semver": "bin/semver.js"
++      },
++      "engines": {
++        "node": ">=10"
++      }
++    },
++    "node_modules/strnum": {
++      "version": "2.5.1",
++      "resolved": "https://registry.npmjs.org/strnum/-/strnum-2.5.1.tgz",
++      "integrity": "sha512-UM4nTLWzQiDBseVxUGxN0wJzIk0UU89Qi7pKXz9qISo+lhviJikTuikBsK/oFRlpvYHvSdz0TVoLyQ+sEpYwxA==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/NaturalIntelligence"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "anynum": "^1.0.1"
++      }
++    },
++    "node_modules/tslib": {
++      "version": "2.8.1",
++      "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.8.1.tgz",
++      "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==",
++      "license": "0BSD"
++    },
++    "node_modules/tunnel": {
++      "version": "0.0.6",
++      "resolved": "https://registry.npmjs.org/tunnel/-/tunnel-0.0.6.tgz",
++      "integrity": "sha512-1h/Lnq9yajKY2PEbBadPXj3VxsDDu844OnaAo52UVmIzIvwwtBPIuNvkjuzBlTWpfJyUbG3ez0KSBibQkj4ojg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.6.11 <=0.7.0 || >=0.7.3"
++      }
++    },
++    "node_modules/undici": {
++      "version": "6.29.1",
++      "resolved": "https://registry.npmjs.org/undici/-/undici-6.29.1.tgz",
++      "integrity": "sha512-EvRlUt/QqAEvXdQeRMYUfwOQsfzpDztykrG2owGEE/rBOBoYv9uF39ZzsNDh4lTFHhTr2XOZjKkYgueD12ZmGA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=18.17"
++      }
++    },
++    "node_modules/xml-naming": {
++      "version": "0.3.0",
++      "resolved": "https://registry.npmjs.org/xml-naming/-/xml-naming-0.3.0.tgz",
++      "integrity": "sha512-ghig2TBE/H11aOVgmahA3MhimvkBr6JIYknH/Dhdk10nXwdbIqBJsbfMxpvFPG8bAw77gN29aQWvKpmVoPlvPQ==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/NaturalIntelligence"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=16.0.0"
++      }
++    }
++  }
++}
+diff --git i/github-actions-cache-adapter/package.json w/github-actions-cache-adapter/package.json
+new file mode 100644
+index 00000000..321a9697
+--- /dev/null
++++ w/github-actions-cache-adapter/package.json
+@@ -0,0 +1,15 @@
++{
++  "name": "github-actions-cache-adapter",
++  "private": true,
++  "engines": {
++    "node": ">=22.0.0"
++  },
++  "type": "module",
++  "license": "MIT",
++  "dependencies": {
++    "@actions/cache": "^6.3.0"
++  },
++  "devDependencies": {
++    "@vercel/ncc": "^0.38.3"
++  }
++}
+diff --git i/include/vcpkg/base/contractual-constants.h w/include/vcpkg/base/contractual-constants.h
+index 828ceab0..8a6abcc8 100644
+--- i/include/vcpkg/base/contractual-constants.h
++++ w/include/vcpkg/base/contractual-constants.h
+@@ -45,9 +45,11 @@ namespace vcpkg
+     inline constexpr StringLiteral JsonIdDetectedCIEnvironment = "detected-ci-environment";
+     inline constexpr StringLiteral JsonIdDetector = "detector";
+     inline constexpr StringLiteral JsonIdDirect = "direct";
++    inline constexpr StringLiteral JsonIdDirectory = "directory";
+     inline constexpr StringLiteral JsonIdDocumentation = "documentation";
+     inline constexpr StringLiteral JsonIdDollarSchema = "$schema";
+     inline constexpr StringLiteral JsonIdDownloads = "downloads";
++    inline constexpr StringLiteral JsonIdEntries = "entries";
+     inline constexpr StringLiteral JsonIdError = "error";
+     inline constexpr StringLiteral JsonIdExecutable = "executable";
+     inline constexpr StringLiteral JsonIdFeatures = "features";
+@@ -74,6 +76,7 @@ namespace vcpkg
+     inline constexpr StringLiteral JsonIdMicrosoft = "microsoft";
+     inline constexpr StringLiteral JsonIdMinVersion = "min-version";
+     inline constexpr StringLiteral JsonIdName = "name";
++    inline constexpr StringLiteral JsonIdOperation = "operation";
+     inline constexpr StringLiteral JsonIdOS = "os";
+     inline constexpr StringLiteral JsonIdOverlayPorts = "overlay-ports";
+     inline constexpr StringLiteral JsonIdOverlayTriplets = "overlay-triplets";
+@@ -496,6 +499,9 @@ namespace vcpkg
+     inline constexpr StringLiteral PolicySkipUsageInstallCheck = "PolicySkipUsageInstallCheck";
+ 
+     // Environment variables are ALL_CAPS_WITH_UNDERSCORES
++    inline constexpr StringLiteral EnvironmentVariableActionsCacheUrl = "ACTIONS_CACHE_URL";
++    inline constexpr StringLiteral EnvironmentVariableActionsResultsUrl = "ACTIONS_RESULTS_URL";
++    inline constexpr StringLiteral EnvironmentVariableActionsRuntimeToken = "ACTIONS_RUNTIME_TOKEN";
+     inline constexpr StringLiteral EnvironmentVariableAndroidNdkHome = "ANDROID_NDK_HOME";
+     inline constexpr StringLiteral EnvironmentVariableAppData = "APPDATA";
+     inline constexpr StringLiteral EnvironmentVariableAppveyor = "APPVEYOR";
+diff --git i/include/vcpkg/base/message-data.inc.h w/include/vcpkg/base/message-data.inc.h
+index 516d3d83..f78c98f1 100644
+--- i/include/vcpkg/base/message-data.inc.h
++++ w/include/vcpkg/base/message-data.inc.h
+@@ -1468,11 +1468,17 @@ DECLARE_MESSAGE(ForMoreHelp,
+                 "Printed before a suggestion for the user to run `vcpkg help <topic>`",
+                 "For More Help")
+ DECLARE_MESSAGE(GetParseFailureInfo, (), "", "Use '--debug' to get more information about the parse failures.")
+-DECLARE_MESSAGE(GhaBinaryCacheDeprecated,
++DECLARE_MESSAGE(GhaAdapterUnavailable,
++                (),
++                "The term 'x-gha' is a vcpkg configuration option",
++                "The x-gha binary source needs github-actions-cache-adapter.mjs, which is not next to vcpkg and could "
++                "not be downloaded.")
++DECLARE_MESSAGE(GhaParametersMissing,
+                 (msg::url),
+                 "The term 'x-gha' is a vcpkg configuration option",
+-                "The 'x-gha' binary caching backend has been removed. Consider using a NuGet-based binary caching "
+-                "provider instead, see extended documentation at {url}.")
++                "The x-gha binary source requires the ACTIONS_RUNTIME_TOKEN and ACTIONS_RESULTS_URL environment "
++                "variables. GitHub Actions sets them only for JavaScript actions, so an earlier step of the job must "
++                "make them available to later steps. See {url} for details.")
+ DECLARE_MESSAGE(GitCommitUpdateVersionDatabase,
+                 (),
+                 "This is a command line; only the 'update version database' part should be localized",
+@@ -1962,6 +1968,10 @@ DECLARE_MESSAGE(InvalidArgumentRequiresValidToken,
+                 "",
+                 "invalid argument: binary config '{binary_source}' requires a SAS token without a "
+                 "preceeding '?' as the second argument")
++DECLARE_MESSAGE(InvalidArgumentRequiresZeroOrOneArgument,
++                (msg::binary_source),
++                "",
++                "invalid argument: binary config '{binary_source}' requires 0 or 1 argument")
+ DECLARE_MESSAGE(
+     InvalidBinaryCacheCompressionLevel,
+     (msg::value),
+@@ -2763,6 +2773,10 @@ DECLARE_MESSAGE(RestoredPackagesFromGCS,
+                 (msg::count, msg::elapsed),
+                 "",
+                 "Restored {count} package(s) from GCS in {elapsed}. Use --debug to see more details.")
++DECLARE_MESSAGE(RestoredPackagesFromGHA,
++                (msg::count, msg::elapsed),
++                "",
++                "Restored {count} package(s) from GitHub Actions Cache in {elapsed}. Use --debug to see more details.")
+ DECLARE_MESSAGE(RestoredPackagesFromHTTP,
+                 (msg::count, msg::elapsed),
+                 "",
+diff --git i/include/vcpkg/binarycaching.h w/include/vcpkg/binarycaching.h
+index a057e2f3..c073778a 100644
+--- i/include/vcpkg/binarycaching.h
++++ w/include/vcpkg/binarycaching.h
+@@ -183,6 +183,9 @@ namespace vcpkg
+         std::vector<std::string> cos_read_prefixes;
+         std::vector<std::string> cos_write_prefixes;
+ 
++        bool gha_read = false;
++        bool gha_write = false;
++
+         std::vector<AzureUpkgSource> upkg_templates_to_get;
+         std::vector<AzureUpkgSource> upkg_templates_to_put;
+ 
+diff --git i/include/vcpkg/vcpkgcmdarguments.h w/include/vcpkg/vcpkgcmdarguments.h
+index 1234de81..6661a1ac 100644
+--- i/include/vcpkg/vcpkgcmdarguments.h
++++ w/include/vcpkg/vcpkgcmdarguments.h
+@@ -242,6 +242,9 @@ namespace vcpkg
+         Optional<std::string> nuget_id_prefix;
+         Optional<bool> use_nuget_cache;
+         Optional<std::string> vcpkg_nuget_repository;
++        Optional<std::string> actions_cache_url;
++        Optional<std::string> actions_results_url;
++        Optional<std::string> actions_runtime_token;
+         Optional<std::string> github_repository;
+         Optional<std::string> github_api_url;
+         Optional<std::string> github_ref;
+diff --git i/locales/messages.json w/locales/messages.json
+index fcc7213d..f7b87fc1 100644
+--- i/locales/messages.json
++++ w/locales/messages.json
+@@ -872,8 +872,10 @@
+   "ForceSystemBinariesOnWeirdPlatforms": "Environment variable VCPKG_FORCE_SYSTEM_BINARIES must be set on arm, s390x, ppc64le and riscv platforms.",
+   "FormattedParseMessageExpressionPrefix": "on expression:",
+   "GetParseFailureInfo": "Use '--debug' to get more information about the parse failures.",
+-  "GhaBinaryCacheDeprecated": "The 'x-gha' binary caching backend has been removed. Consider using a NuGet-based binary caching provider instead, see extended documentation at {url}.",
+-  "_GhaBinaryCacheDeprecated.comment": "The term 'x-gha' is a vcpkg configuration option An example of {url} is https://github.com/microsoft/vcpkg.",
++  "GhaAdapterUnavailable": "The x-gha binary source needs github-actions-cache-adapter.mjs, which is not next to vcpkg and could not be downloaded.",
++  "_GhaAdapterUnavailable.comment": "The term 'x-gha' is a vcpkg configuration option",
++  "GhaParametersMissing": "The x-gha binary source requires the ACTIONS_RUNTIME_TOKEN and ACTIONS_RESULTS_URL environment variables. GitHub Actions sets them only for JavaScript actions, so an earlier step of the job must make them available to later steps. See {url} for details.",
++  "_GhaParametersMissing.comment": "The term 'x-gha' is a vcpkg configuration option An example of {url} is https://github.com/microsoft/vcpkg.",
+   "GitCommitUpdateVersionDatabase": "git commit -m \"Update version database\"",
+   "_GitCommitUpdateVersionDatabase.comment": "This is a command line; only the 'update version database' part should be localized",
+   "GitRegistryMustHaveBaseline": "The git registry \"{url}\" must have a \"baseline\" field that is a valid git commit SHA (40 hexadecimal characters).\nTo use the current latest versions, set baseline to that repo's HEAD, \"{commit_sha}\".",
+@@ -1066,6 +1068,8 @@
+   "_InvalidArgumentRequiresTwoOrThreeArguments.comment": "An example of {binary_source} is azblob.",
+   "InvalidArgumentRequiresValidToken": "invalid argument: binary config '{binary_source}' requires a SAS token without a preceeding '?' as the second argument",
+   "_InvalidArgumentRequiresValidToken.comment": "An example of {binary_source} is azblob.",
++  "InvalidArgumentRequiresZeroOrOneArgument": "invalid argument: binary config '{binary_source}' requires 0 or 1 argument",
++  "_InvalidArgumentRequiresZeroOrOneArgument.comment": "An example of {binary_source} is azblob.",
+   "InvalidBinaryCacheCompressionLevel": "Invalid binary cache compression level '{value}'. --binary-cache-compression-level and VCPKG_BINARY_CACHE_COMPRESSION_LEVEL require a single digit (0-9).",
+   "_InvalidBinaryCacheCompressionLevel.comment": "{value} is the supplied compression level.",
+   "InvalidBuildInfo": "Invalid BUILD_INFO file for package: {error_msg}",
+@@ -1432,6 +1436,8 @@
+   "_RestoredPackagesFromFiles.comment": "An example of {count} is 42. An example of {elapsed} is 3.532 min. An example of {path} is /foo/bar.",
+   "RestoredPackagesFromGCS": "Restored {count} package(s) from GCS in {elapsed}. Use --debug to see more details.",
+   "_RestoredPackagesFromGCS.comment": "An example of {count} is 42. An example of {elapsed} is 3.532 min.",
++  "RestoredPackagesFromGHA": "Restored {count} package(s) from GitHub Actions Cache in {elapsed}. Use --debug to see more details.",
++  "_RestoredPackagesFromGHA.comment": "An example of {count} is 42. An example of {elapsed} is 3.532 min.",
+   "RestoredPackagesFromHTTP": "Restored {count} package(s) from HTTP servers in {elapsed}. Use --debug to see more details.",
+   "_RestoredPackagesFromHTTP.comment": "An example of {count} is 42. An example of {elapsed} is 3.532 min.",
+   "RestoredPackagesFromNuGet": "Restored {count} package(s) from NuGet in {elapsed}. Use --debug to see more details.",
+diff --git i/src/vcpkg-test/configparser.cpp w/src/vcpkg-test/configparser.cpp
+index f6c611b0..8ee31755 100644
+--- i/src/vcpkg-test/configparser.cpp
++++ w/src/vcpkg-test/configparser.cpp
+@@ -724,6 +724,55 @@ TEST_CASE ("BinaryConfigParser GCS provider", "[binaryconfigparser]")
+     }
+ }
+ 
++TEST_CASE ("BinaryConfigParser GitHub Actions provider", "[binaryconfigparser]")
++{
++    {
++        auto parsed = parse_binary_provider_configs("x-gha", {});
++        auto state = parsed.value_or_exit(VCPKG_LINE_INFO);
++
++        REQUIRE(state.binary_cache_providers == std::set<StringLiteral>{{"default"}, {"gha"}});
++        REQUIRE(state.gha_read);
++        REQUIRE(!state.gha_write);
++    }
++    {
++        auto parsed = parse_binary_provider_configs("x-gha,read", {});
++        auto state = parsed.value_or_exit(VCPKG_LINE_INFO);
++
++        REQUIRE(state.gha_read);
++        REQUIRE(!state.gha_write);
++    }
++    {
++        auto parsed = parse_binary_provider_configs("x-gha,write", {});
++        auto state = parsed.value_or_exit(VCPKG_LINE_INFO);
++
++        REQUIRE(!state.gha_read);
++        REQUIRE(state.gha_write);
++    }
++    {
++        auto parsed = parse_binary_provider_configs("x-gha,readwrite", {});
++        auto state = parsed.value_or_exit(VCPKG_LINE_INFO);
++
++        REQUIRE(state.gha_read);
++        REQUIRE(state.gha_write);
++    }
++    {
++        auto parsed = parse_binary_provider_configs("x-gha,invalid", {});
++        REQUIRE(!parsed.has_value());
++    }
++    {
++        auto parsed = parse_binary_provider_configs("x-gha,readwrite,extra", {});
++        REQUIRE(!parsed.has_value());
++    }
++    {
++        auto parsed = parse_binary_provider_configs("x-gha,readwrite;clear", {});
++        auto state = parsed.value_or_exit(VCPKG_LINE_INFO);
++
++        REQUIRE(state.binary_cache_providers == std::set<StringLiteral>{{"clear"}});
++        REQUIRE(!state.gha_read);
++        REQUIRE(!state.gha_write);
++    }
++}
++
+ TEST_CASE ("BinaryConfigParser HTTP provider", "[binaryconfigparser]")
+ {
+     {
+diff --git i/src/vcpkg/binarycaching.cpp w/src/vcpkg/binarycaching.cpp
+index fb7fa5bd..fa1fbf68 100644
+--- i/src/vcpkg/binarycaching.cpp
++++ w/src/vcpkg/binarycaching.cpp
+@@ -20,6 +20,8 @@
+ #include <vcpkg/archives.h>
+ #include <vcpkg/binarycaching.h>
+ #include <vcpkg/binarycaching.private.h>
++#include <vcpkg/commands.version.h>
++#include <vcpkg/configure-environment.h>
+ #include <vcpkg/dependencies.h>
+ #include <vcpkg/documentation.h>
+ #include <vcpkg/metrics.h>
+@@ -1351,6 +1353,135 @@ namespace
+         Path m_tool;
+     };
+ 
++    // The GitHub Actions cache has no public API, and GitHub supports only @actions/cache as its client, so x-gha runs
++    // that package through github-actions-cache-adapter.mjs; see github-actions-cache-adapter/main.mjs.
++    struct GhaCacheAdapter
++    {
++        GhaCacheAdapter(const Path& node, Path&& script) : m_node(node), m_script(std::move(script)) { }
++
++        // Each entry pairs a cache key with the name of an archive in `directory`.
++        bool run(DiagnosticContext& context,
++                 StringLiteral operation,
++                 const Path& directory,
++                 View<std::pair<std::string, std::string>> entries) const
++        {
++            Json::Array entries_json;
++            for (auto&& entry : entries)
++            {
++                auto& entry_json = entries_json.push_back(Json::Object{});
++                entry_json.insert(JsonIdKey, entry.first);
++                entry_json.insert(JsonIdPath, entry.second);
++            }
++
++            Json::Object request;
++            request.insert(JsonIdOperation, operation);
++            request.insert(JsonIdDirectory, directory.native());
++            request.insert(JsonIdEntries, std::move(entries_json));
++
++            auto cmd = Command{m_node}.string_arg(m_script);
++            RedirectedProcessLaunchSettings settings;
++            settings.stdin_content = Json::stringify(request);
++            auto maybe_output = cmd_execute_and_capture_output(context, cmd, settings);
++            return check_zero_exit_code(context, cmd, maybe_output, EchoInDebug::Show) != nullptr;
++        }
++
++    private:
++        Path m_node;
++        Path m_script;
++    };
++
++    std::string make_gha_cache_key(const PackageSpec& spec, StringView abi)
++    {
++        return fmt::format("vcpkg-{}-{}", spec.name(), abi);
++    }
++
++    // @actions/cache hashes this name into the cache version, so it must not depend on where vcpkg is. BinaryCache
++    // creates the archive to push as package_dir + ".zip", which yields the same name.
++    std::string make_gha_archive_name(const Path& package_dir)
++    {
++        return Strings::concat(package_dir.filename(), ".zip");
++    }
++
++    struct GhaBinaryProvider : ZipReadBinaryProvider
++    {
++        GhaBinaryProvider(const ZipTool& zip, const Path& buildtrees, std::shared_ptr<const GhaCacheAdapter> adapter)
++            : ZipReadBinaryProvider(zip), m_buildtrees(buildtrees), m_adapter(std::move(adapter))
++        {
++        }
++
++        void acquire_zips(DiagnosticContext& context,
++                          const Filesystem& fs,
++                          View<const InstallPlanAction*> actions,
++                          Span<Optional<ZipResource>> out_zip_paths) const override
++        {
++            WarningDiagnosticContext wdc{context};
++            const auto directory = m_buildtrees / ".gha";
++            // The adapter reports hits by leaving archives here, so archives from an earlier run must not remain.
++            if (!fs.remove_all(wdc, directory) || !fs.create_directories(wdc, directory))
++            {
++                return;
++            }
++
++            std::vector<std::pair<std::string, std::string>> entries;
++            entries.reserve(actions.size());
++            for (auto&& action : actions)
++            {
++                entries.emplace_back(make_gha_cache_key(action->spec, action->package_abi_or_exit(VCPKG_LINE_INFO)),
++                                     make_gha_archive_name(action->package_dir));
++            }
++
++            // A failure for some entries still leaves the others usable.
++            (void)m_adapter->run(wdc, "restore", directory, entries);
++            for (size_t idx = 0; idx < actions.size(); ++idx)
++            {
++                auto archive_path = directory / entries[idx].second;
++                if (fs.exists(archive_path, IgnoreErrors{}))
++                {
++                    out_zip_paths[idx].emplace(std::move(archive_path), RemoveWhen::always);
++                }
++            }
++        }
++
++        // Checking would cost a cache request per package, so availability stays unknown.
++        void precheck(DiagnosticContext&,
++                      const Filesystem&,
++                      View<const InstallPlanAction*>,
++                      Span<CacheAvailability>) const override
++        {
++        }
++
++        LocalizedString restored_message(size_t count,
++                                         std::chrono::high_resolution_clock::duration elapsed) const override
++        {
++            return msg::format(msgRestoredPackagesFromGHA, msg::count = count, msg::elapsed = ElapsedTime(elapsed));
++        }
++
++        Path m_buildtrees;
++        std::shared_ptr<const GhaCacheAdapter> m_adapter;
++    };
++
++    struct GhaBinaryPushProvider : IWriteBinaryProvider
++    {
++        GhaBinaryPushProvider(std::shared_ptr<const GhaCacheAdapter> adapter) : m_adapter(std::move(adapter)) { }
++
++        size_t push_success(DiagnosticContext& context,
++                            const Filesystem&,
++                            const BinaryPackageWriteInfo& request) override
++        {
++            if (!request.zip_path) return 0;
++            const auto& zip_path = *request.zip_path.get();
++            const std::pair<std::string, std::string> entry{make_gha_cache_key(request.spec, request.package_abi),
++                                                            zip_path.filename().to_string()};
++            WarningDiagnosticContext wdc{context};
++            return m_adapter->run(wdc, "save", Path{zip_path.parent_path()}, {&entry, 1}) ? 1 : 0;
++        }
++
++        bool needs_nuspec_data() const override { return false; }
++        bool needs_zip_file() const override { return true; }
++
++        std::shared_ptr<const GhaCacheAdapter> m_adapter;
++    };
++
+     struct GcsStorageTool : IObjectStorageTool
+     {
+         GcsStorageTool(const Path& tool) : m_tool(tool) { }
+@@ -2167,7 +2298,16 @@ namespace
+             }
+             else if (segments[0].second == "x-gha")
+             {
+-                add_warning(msg::format(msgGhaBinaryCacheDeprecated, msg::url = docs::binarycaching_url));
++                // Scheme: x-gha[,<readwrite>]
++                if (segments.size() > 2)
++                {
++                    return add_error(
++                        msg::format(msgInvalidArgumentRequiresZeroOrOneArgument, msg::binary_source = "x-gha"),
++                        segments[2].first);
++                }
++
++                handle_readwrite(state->gha_read, state->gha_write, segments, 1);
++                state->binary_cache_providers.insert("gha");
+             }
+             else if (segments[0].second == "http")
+             {
+@@ -2795,10 +2935,47 @@ namespace vcpkg
+                     return false;
+                 }
+             }
++            std::shared_ptr<const GhaCacheAdapter> gha_adapter;
++            if (s.gha_read || s.gha_write)
++            {
++                if (!args.actions_runtime_token.has_value() ||
++                    !(args.actions_results_url.has_value() || args.actions_cache_url.has_value()))
++                {
++                    context.report_error(msg::format(msgGhaParametersMissing, msg::url = docs::binarycaching_url));
++                    return false;
++                }
++
++                const auto* node = tools.get_tool_path(context, fs, Tools::NODE);
++                if (!node)
++                {
++                    return false;
++                }
++
++                Optional<std::string> script_sha512;
++#if defined(VCPKG_GITHUB_ACTIONS_CACHE_ADAPTER_SHA)
++                script_sha512.emplace(MACRO_TO_STRING(VCPKG_GITHUB_ACTIONS_CACHE_ADAPTER_SHA));
++#endif
++                auto maybe_script = provision_node_component(context,
++                                                             get_exe_path_of_current_process(),
++                                                             paths.get_asset_cache_settings(),
++                                                             fs,
++                                                             paths.downloads,
++                                                             "github-actions-cache-adapter",
++                                                             script_sha512);
++                if (auto script = maybe_script.get())
++                {
++                    gha_adapter = std::make_shared<const GhaCacheAdapter>(*node, std::move(*script));
++                }
++                else
++                {
++                    context.report_error(msg::format(msgGhaAdapterUnavailable));
++                    return false;
++                }
++            }
+ 
+             if (!s.archives_to_read.empty() || !s.url_templates_to_get.empty() || !s.gcs_read_prefixes.empty() ||
+                 !s.aws_read_prefixes.empty() || !s.cos_read_prefixes.empty() || !s.upkg_templates_to_get.empty() ||
+-                !s.azcopy_read_templates.empty())
++                !s.azcopy_read_templates.empty() || s.gha_read)
+             {
+                 ZipTool zip_tool;
+                 if (!zip_tool.setup(context, fs, tools))
+@@ -2856,6 +3033,11 @@ namespace vcpkg
+                     m_config.read.push_back(
+                         std::make_unique<AzCopyStorageProvider>(zip_tool, buildtrees, std::move(prefix), azcopy_tool));
+                 }
++
++                if (s.gha_read)
++                {
++                    m_config.read.push_back(std::make_unique<GhaBinaryProvider>(zip_tool, buildtrees, gha_adapter));
++                }
+             }
+             if (!s.upkg_templates_to_put.empty())
+             {
+@@ -2898,6 +3080,10 @@ namespace vcpkg
+                 m_config.write.push_back(
+                     std::make_unique<ObjectStoragePushProvider>(std::move(s.cos_write_prefixes), cos_tool));
+             }
++            if (s.gha_write)
++            {
++                m_config.write.push_back(std::make_unique<GhaBinaryPushProvider>(gha_adapter));
++            }
+ 
+             if (!s.sources_to_read.empty() || !s.configs_to_read.empty() || !s.sources_to_write.empty() ||
+                 !s.configs_to_write.empty())
+diff --git i/src/vcpkg/vcpkgcmdarguments.cpp w/src/vcpkg/vcpkgcmdarguments.cpp
+index a485e252..e8c1a8a6 100644
+--- i/src/vcpkg/vcpkgcmdarguments.cpp
++++ w/src/vcpkg/vcpkgcmdarguments.cpp
+@@ -579,6 +579,9 @@ namespace vcpkg
+             return Strings::case_insensitive_ascii_equals(s, "true") || s == "1";
+         });
+         from_env(get_env, EnvironmentVariableVcpkgNuGetRepository, vcpkg_nuget_repository);
++        from_env(get_env, EnvironmentVariableActionsCacheUrl, actions_cache_url);
++        from_env(get_env, EnvironmentVariableActionsResultsUrl, actions_results_url);
++        from_env(get_env, EnvironmentVariableActionsRuntimeToken, actions_runtime_token);
+         from_env(get_env, EnvironmentVariableGitHubRepository, github_repository);
+         from_env(get_env, EnvironmentVariableGitHubApiUrl, github_api_url);
+         from_env(get_env, EnvironmentVariableGitHubRef, github_ref);

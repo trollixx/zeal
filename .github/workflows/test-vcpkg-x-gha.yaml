@@ -1,0 +1,141 @@
+# Experiment: vcpkg's x-gha binary source, rebuilt on top of @actions/cache.
+# Builds vcpkg from microsoft/vcpkg-tool plus .github/vcpkg-tool-x-gha.patch, then installs Zeal's vcpkg
+# dependencies twice per architecture: the first pass builds and uploads, the second should restore everything.
+
+name: Test vcpkg x-gha
+
+on:
+  push:
+    branches: [ci-github-vcpkg-x-gha-test]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VCPKG_TOOL_REF: 4bbb0f73b293c2701541c640a6a4f8cbbf31018e
+
+jobs:
+  build-vcpkg:
+    name: Build vcpkg (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-2025-vs2026
+            preset: Win-x64-Release
+            vsarch: amd64
+          - arch: arm64
+            os: windows-11-arm
+            preset: Win-arm64-Release
+            vsarch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Checkout vcpkg-tool
+        uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg-tool
+          ref: ${{ env.VCPKG_TOOL_REF }}
+          path: vcpkg-tool
+
+      - name: Apply x-gha patch
+        run: git -C vcpkg-tool apply --verbose ../.github/vcpkg-tool-x-gha.patch
+
+      - name: Build vcpkg
+        shell: cmd
+        working-directory: vcpkg-tool
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=${{ matrix.vsarch }} -host_arch=${{ matrix.vsarch }}
+          IF %ERRORLEVEL% NEQ 0 exit /B %ERRORLEVEL%
+          set CXX=cl
+          set CC=cl
+          cmake --preset ${{ matrix.preset }}
+          IF %ERRORLEVEL% NEQ 0 exit /B %ERRORLEVEL%
+          cmake --build out/build/${{ matrix.preset }} --target vcpkg
+
+      - name: Build cache adapter
+        working-directory: vcpkg-tool/github-actions-cache-adapter
+        run: |
+          npm ci --include=dev --registry=https://registry.npmjs.org/
+          node node_modules/@vercel/ncc/dist/ncc/cli.js build main.mjs --out dist
+
+      - name: Stage files
+        run: |
+          New-Item -ItemType Directory -Force staging | Out-Null
+          Copy-Item vcpkg-tool/out/build/${{ matrix.preset }}/vcpkg.exe staging/
+          Copy-Item vcpkg-tool/github-actions-cache-adapter/dist/index.mjs staging/github-actions-cache-adapter.mjs
+
+      - name: Upload vcpkg
+        uses: actions/upload-artifact@v7
+        with:
+          name: vcpkg-${{ matrix.arch }}
+          path: staging/
+
+  install:
+    name: Install deps (${{ matrix.arch }})
+    needs: build-vcpkg
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-2022
+            triplet: x64-windows-release
+          - arch: arm64
+            os: windows-11-arm
+            triplet: arm64-windows
+
+    env:
+      VCPKG_BINARY_SOURCES: clear;x-gha,readwrite
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Prepare vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: ${{ github.workspace }}/.vcpkg
+
+      - name: Download patched vcpkg
+        uses: actions/download-artifact@v8
+        with:
+          name: vcpkg-${{ matrix.arch }}
+          path: patched-vcpkg
+
+      - name: Replace vcpkg
+        run: Copy-Item -Force patched-vcpkg/* .vcpkg/
+
+      # GitHub Actions gives the cache service credentials only to JavaScript actions.
+      - name: Expose GitHub Actions cache to vcpkg
+        uses: actions/github-script@v9
+        with:
+          script: |
+            core.setSecret(process.env.ACTIONS_RUNTIME_TOKEN);
+            for (const name of ['ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_CACHE_SERVICE_V2', 'ACTIONS_CACHE_MODE']) {
+              if (process.env[name]) {
+                core.exportVariable(name, process.env[name]);
+              }
+            }
+
+      - name: Show vcpkg version
+        run: .vcpkg/vcpkg.exe version
+
+      - name: Install (first pass)
+        run: >-
+          .vcpkg/vcpkg.exe install --triplet ${{ matrix.triplet }} --x-install-root=installed-1
+          --x-abi-tools-use-exact-versions
+
+      - name: Remove first pass results
+        run: Remove-Item -Recurse -Force installed-1, .vcpkg/buildtrees, .vcpkg/packages
+
+      - name: Install (second pass)
+        run: >-
+          .vcpkg/vcpkg.exe install --triplet ${{ matrix.triplet }} --x-install-root=installed-2
+          --x-abi-tools-use-exact-versions
